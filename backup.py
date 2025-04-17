@@ -1,5 +1,6 @@
 # Copyright (c) 2025 Joe Walter
 
+# TODO load folder-by-folder from _listdir if rename_threshold is None (no renames means dir contents don't need to be loaded completely into memory)
 # TODO Backup class to reduce arg passing (_listdir is an issue b/c it takes two sets of args depending on the root to search)
 # TODO wildcards in `only`
 # TODO testing
@@ -244,61 +245,62 @@ def _listdir(root, only, ignore_missing, exclude):
 	#file_list.nonempty_dirs = set()
 
 	if only:
-
 		if isinstance(only, str):
 			only = [only]
-
-		for relpath in only:
-			#if any(relpath.endswith(ft) for ft in exclude_filetypes):
-			#	continue
-			path = os.path.join(root, relpath)
-			if not os.path.isfile(path):
-				if ignore_missing:
-					continue
-				raise ValueError(path)
-			stats = os.stat(path)
-			file_list.relpath_stats[relpath] = Metadata(stats.st_size, stats.st_mtime)
-		return file_list
-
+		only = [os.path.join(root, f) for f in only]
 	else:
+		only = [root]
 
-		if isinstance(exclude, str):
-			exclude = [exclude]
+	if isinstance(exclude, str):
+		exclude = [exclude]
 
-		exclude_files = set(f for f in exclude if not f.endswith(os.sep))
-		exclude_dirs  = set(f[:-1] if f.endswith(os.sep) else f for f in exclude)
+	exclude_files = set(f for f in exclude if not f.endswith(os.sep))
+	exclude_dirs  = set(f[:-1] if f.endswith(os.sep) else f for f in exclude)
 
-		exclude_dirnames  = set(f for f in exclude_dirs if os.sep not in f)
-		exclude_dirpaths  = set(os.path.join(root, f) for f in exclude_dirs if os.sep in f)
-		exclude_filenames = set(f for f in exclude_files if os.sep not in f)
-		exclude_filepaths = set(os.path.join(root, f) for f in exclude_files if os.sep in f)
+	exclude_dirnames  = set(f for f in exclude_dirs if os.sep not in f)
+	exclude_dirpaths  = set(os.path.normpath(os.path.join(root, f)) for f in exclude_dirs if os.sep in f[2:])
+	exclude_filenames = set(f for f in exclude_files if os.sep not in f)
+	exclude_filepaths = set(os.path.normpath(os.path.join(root, f)) for f in exclude_files if os.sep in f[2:])
 
-		for dir, dirnames, filenames in os.walk(root):
-			i = 0
-			while i < len(dirnames):
-				dirname = dirnames[i]
-				if any(fnmatch(dirname, pat) for pat in exclude_dirnames):
-					del dirnames[i]
-					i -= 1
-				else:
-					dir_relpath = os.path.relpath(os.path.join(dir, dirname), root)
-					if any(fnmatch(dir_relpath, pat) for pat in exclude_dirpaths):
+	for entry in only:
+		if not os.path.exists(entry):
+			if ignore_missing:
+				continue
+			msg = f"Path in `only` argument points to missing file: {entry}"
+			raise ValueError(msg)
+		if os.path.isfile(entry):
+			relpath = os.path.relpath(entry, root)
+			stats = os.stat(entry)
+			file_list.relpath_stats[relpath] = Metadata(stats.st_size, stats.st_mtime)
+		else:
+			for dir, dirnames, filenames in os.walk(entry):
+				dir_relpath = os.path.relpath(dir, root)
+				if not filenames and not dirnames:
+					file_list.empty_dirs.add(dir_relpath)
+				#else:
+				#	file_list.nonempty_dirs.add(dir_relpath)
+				i = 0
+				while i < len(dirnames):
+					dirname = dirnames[i]
+					if any(fnmatch(dirname, pat) for pat in exclude_dirnames):
 						del dirnames[i]
-						i -= 1
-				i += 1
-			dir_relpath = os.path.relpath(dir, root)
-			if not filenames and not dirnames:
-				file_list.empty_dirs.add(dir_relpath)
-			for filename in filenames:
-				if any(fnmatch(filename, pat) for pat in exclude_filenames):
-					continue
-				filepath = os.path.join(dir, filename)
-				if any(fnmatch(filepath, pat) for pat in exclude_filepaths):
-					continue
-				relpath = os.path.relpath(filepath, root)
-				stats = os.stat(filepath)
-				file_list.relpath_stats[relpath] = Metadata(stats.st_size, stats.st_mtime)
-		return file_list
+						continue
+					dir_path = os.path.join(dir, dirname)
+					dir_relpath = os.path.relpath(dir_path, root)
+					if any(fnmatch(dir_path, pat) for pat in exclude_dirpaths):
+						del dirnames[i]
+						continue
+					i += 1
+				for filename in filenames:
+					if any(fnmatch(filename, pat) for pat in exclude_filenames):
+						continue
+					file_path = os.path.join(dir, filename)
+					file_relpath = os.path.relpath(file_path, root)
+					if any(fnmatch(file_relpath, pat) for pat in exclude_filepaths):
+						continue
+					stats = os.stat(file_path)
+					file_list.relpath_stats[file_relpath] = Metadata(stats.st_size, stats.st_mtime)
+	return file_list
 
 def _operations(src_files, dst_files, src_root, dst_root, trash_dir, rename_threshold, metadata_only):
 	src_relpath_stats = src_files.relpath_stats
