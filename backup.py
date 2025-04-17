@@ -20,6 +20,7 @@ from fnmatch import fnmatch
 from collections import Counter
 from collections import namedtuple
 from types import SimpleNamespace
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -225,6 +226,7 @@ def _fnmatch(path, pattern):
 		return False
 	return fnmatch(path, pattern)
 
+@lru_cache
 def _dpmatch(path, pattern):
 	if path.count(os.sep) < pattern.count(os.sep):
 		return False
