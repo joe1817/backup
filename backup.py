@@ -350,9 +350,9 @@ def _listdir(root, include, ignore_missing, exclude):
 		for dir in include_filepaths:
 			while True:
 				dir = os.path.dirname(dir)
+				ancestors_of_included.add(dir)
 				if not dir:
 					break
-				ancestors_of_included.add(dir)
 
 	# determine how deep a scan is necessary
 	# TODO depth can change based on current dir
