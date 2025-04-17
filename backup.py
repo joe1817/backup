@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Joe Walter
 
 # TODO load folder-by-folder from _listdir if rename_threshold is None (no renames means dir contents don't need to be loaded completely into memory)
-# TODO could laos load folder-by-folder if potential renames are not checked between folders
+# TODO could also load folder-by-folder if potential renames are not checked between folders
 # TODO Backup class to reduce arg passing (_listdir is an issue b/c it takes two sets of args depending on the root to search)
 # TODO testing
 # TODO write a method to do backup()s in stages for large directories
@@ -339,18 +339,18 @@ def _listdir(root, include, ignore_missing, exclude):
 
 	# gather dirs for a narrow search
 	# if filename or dirname patterns exists then do a full scan
-	include_paths = set()
+	ancestors_of_included = set()
 	if not include_filenames and not include_dirnames:
 		for dir in include_dirpaths:
 			while dir:
-				include_paths.add(dir)
+				ancestors_of_included.add(dir)
 				dir = os.path.dirname(dir)
 		for dir in include_filepaths:
 			while True:
 				dir = os.path.dirname(dir)
 				if not dir:
 					break
-				include_paths.add(dir)
+				ancestors_of_included.add(dir)
 
 	# determine how deep a scan is necessary
 	# TODO depth can change based on current dir
@@ -360,7 +360,7 @@ def _listdir(root, include, ignore_missing, exclude):
 		max_depth = 9999
 
 	logger.debug(f"{max_depth=}")
-	logger.debug(f"{include_paths=}")
+	logger.debug(f"{ancestors_of_included=}")
 	logger.debug(f"{include_dirnames=}")
 	logger.debug(f"{include_dirpaths=}")
 	logger.debug(f"{include_filenames=}")
@@ -369,19 +369,45 @@ def _listdir(root, include, ignore_missing, exclude):
 	logger.debug(f"{exclude_dirpaths=}")
 	logger.debug(f"{exclude_filenames=}")
 	logger.debug(f"{exclude_filepaths=}")
-	logger.debug(f"{include_paths=}")
+	logger.debug(f"{ancestors_of_included=}")
 	logger.debug("***")
 
 	used_path_patterns = set()
 
+	in_included_relpath_dir = False
+	depth_in_included_relpath_dir = 9999
+
 	for dir, subdirnames, filenames in os.walk(root):
-		print(dir)
+		print("in " + dir)
+
 		# sorting may be needed if _listdir is changed to yield folder-by-folder
 		#subdirnames.sort()
 		#filenames.sort()
-		logger.debug(f"in {dir}")
-		dirname = os.path.basename(dir)
+
+		dirname     = os.path.basename(dir)
 		dir_relpath = os.path.relpath(dir, root)
+		depth       = dir_relpath.count(os.sep)
+
+		if depth <= depth_in_included_relpath_dir:
+			if any(_dpmatch(dir_relpath, pat) for pat in include_dirpaths):
+				in_included_relpath_dir = True
+				depth_in_included_relpath_dir = depth
+			else:
+				in_included_relpath_dir = False
+				depth_in_included_relpath_dir = 9999
+
+		# determine which dirpath pattern includes this dir, if any
+		# TODO? move into depth calc section
+		if not ignore_missing and depth == depth_in_included_relpath_dir:
+			for pat in include_dirpaths:
+				if _fnmatch(dir_relpath, pat): #okay to use fnmatch
+					used_path_patterns.add(pat)
+					break
+
+		# determine if we're in an explicitly included dir
+		# this may not be the case during full searches (i.e., searches with name patterns)
+		in_included_dir =	(in_included_relpath_dir) or \
+							(include_dirnames and any(_fnmatch(dirname, pat) for pat in include_dirnames))
 
 		# catalog empty directory
 		if not filenames and not subdirnames:
@@ -390,8 +416,8 @@ def _listdir(root, include, ignore_missing, exclude):
 		#else:
 		#	file_list.nonempty_dirs.add(dir_relpath)
 
-		# do not recurse if dir is as deep as the deepest 'include' pattern, which are all relpaths
-		if dir_relpath.count(os.sep) == max_depth:
+		# do not recurse if dir is as deep as the deepest 'include' file pattern, which are all relpaths
+		if depth == max_depth:
 			subdirnames[:] = []
 
 		# in case _listdir is given a recurse option
@@ -415,23 +441,11 @@ def _listdir(root, include, ignore_missing, exclude):
 				continue
 
 			# prune search tree during narrow searches (i.e., searches with only relpath patterns)
-			if include_paths and not any(_dpmatch(subdir_relpath, pat) for pat in include_paths):
+			# paths need to be a child to a an included dir or a parent to an included entry (file or dir)
+			if not in_included_dir and ancestors_of_included and not any(_fnmatch(subdir_relpath, pat) for pat in ancestors_of_included):
 				del subdirnames[i]
 				continue
 			i += 1
-
-		# determine if we're in an explicitly included dir
-		# this may not be the case during full searches (i.e., searches with name patterns)
-		in_included_dir =	(not include_dirpaths and not include_dirnames) or \
-							(    include_dirpaths and any(_dpmatch(dir_relpath, pat) for pat in include_dirpaths)) or \
-							(    include_dirnames and any(_fnmatch(dirname, pat) for pat in include_dirnames))
-
-		# determine which dirpath pattern includes this dir, if any
-		if not ignore_missing:
-			for pat in include_dirpaths:
-				if _fnmatch(dir_relpath, pat): #okay to use fnmatch
-					used_path_patterns.add(pat)
-					break
 
 		for filename in filenames:
 			# prune by excluded file names
@@ -445,9 +459,8 @@ def _listdir(root, include, ignore_missing, exclude):
 				continue
 
 			# determine if this is an explicitly included file
-			included_file = (not include_filepaths and not include_filenames) or \
-							(    include_filepaths and any(_fnmatch(file_relpath, pat) for pat in include_filepaths)) or \
-							(    include_filenames and any(_fnmatch(filename, pat) for pat in include_filenames))
+			included_file = (include_filepaths and any(_fnmatch(file_relpath, pat) for pat in include_filepaths)) or \
+							(include_filenames and any(_fnmatch(filename, pat) for pat in include_filenames))
 
 			# determine which filepath pattern includes this file, if any
 			if not ignore_missing:
@@ -457,14 +470,14 @@ def _listdir(root, include, ignore_missing, exclude):
 						break
 
 			# ignore file if it is not specified by a file-select pattern or dir-select pattern
-			if not in_included_dir and not included_file:
+			if include and not in_included_dir and not included_file:
 				continue
 
 			# file meets all criteria, add it to the return result
 			stats = os.stat(file_path)
 			file_list.relpath_stats[file_relpath] = Metadata(stats.st_size, stats.st_mtime)
 
-	# raise error if any explicityl included files were not found during the search, unless ignore_missing is True
+	# raise error if any explicitly included files were not found during the search, unless ignore_missing is True
 	if not ignore_missing:
 		unused_path_patterns = (include_dirpaths | include_filepaths) - used_path_patterns
 		if unused_path_patterns:
