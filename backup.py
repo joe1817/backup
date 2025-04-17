@@ -1,7 +1,9 @@
 # Copyright (c) 2025 Joe Walter
 
+# TODO load folder-by-folder from _listdir if rename_threshold is None (no renames means dir contents don't need to be loaded completely into memory)
+# TODO could also load folder-by-folder if potential renames are not checked between folders
 # TODO Backup class to reduce arg passing (_listdir is an issue b/c it takes two sets of args depending on the root to search)
-# TODO wildcards in `only`
+# TODO _Pattern class
 # TODO testing
 # TODO write a method to do backup()s in stages for large directories
 
@@ -19,6 +21,7 @@ from fnmatch import fnmatch
 from collections import Counter
 from collections import namedtuple
 from types import SimpleNamespace
+from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -39,7 +42,7 @@ class Results:
 	def err_count(self):
 		return self.create_error + self.rename_error + self.update_error + self.delete_error
 
-def backup(src_root, dst_root, *, trash_root=None, only=[], ignore_missing=False, exclude=[], rename_threshold=10000, metadata_only=False, dry_run=False, log_path="-", quiet=False, veryquiet=False):
+def backup(src_root, dst_root, *, trash_root=None, include=[], ignore_missing=False, exclude=[], rename_threshold=10000, metadata_only=False, dry_run=False, log_path="-", quiet=False, veryquiet=False):
 	'''
 	Copies new and updated files from `src_root` to `dst_root`, and optionally "deletes" files from `dst_root` if they are not present in `src_root` (they will be moved into `trash_root`, preserving directory structure). Furthermore, files that exist in `dst_root` but renamed in `src_root` may be renamed in `dst_root` to match. Candidates for rename are discovered by searching for files with an identical metadata signature, consisting of file size and modification time. These candidates must be above a minimum size threshold (`rename_threshold`) and have an unambiguously unique metadata signature within their respective root directories. The user is asked to confirm these renames before they are committed.
 
@@ -47,9 +50,9 @@ def backup(src_root, dst_root, *, trash_root=None, only=[], ignore_missing=False
 		src_root (str)         : The root directory to copy files from.
 		dst_root (str)         : The root directory to copy files to.
 		trash_root (str)       : The root directory to place files that are "deleted" from `dst_root`. Must be on the same filesystem as `dst_root`. Files will not be "deleted" if this is `None`. (Defaults to `None`.)
-		only (list(str))       : A whitelist of relative paths that will exclude all other files and directories from the backup. Wildcards are not supported at this time. (Defaults to `[]`.)
-		ignore_missing (bool)  : Whether the relative paths indicated by `only` may point to non-existent files in `src_root`. (Defaults to `False`.)
-		exclude (list(str))    : A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to entries in `src_root` and `dst_root`, except for those indicated by `only`. Entries ending with `os.sep` will be treated as a directory only. (Defaults to `[]`.)
+		include (list(str))    : A whitelist of relative paths that will exclude all other files and directories from the backup. Non-recursive globs (e.g., *.txt) are supported. (Defaults to `[]`.)
+		ignore_missing (bool)  : Whether the relative paths indicated by `include` may point to non-existent files in `src_root`. (Defaults to `False`.)
+		exclude (list(str))    : A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to entries in `src_root` and `dst_root`, except for those indicated by `include`. Entries ending with `os.sep` will be treated as a directory only. (Defaults to `[]`.)
 		rename_threshold (int) : The minimum size in bytes needed to consider renaming files in `dst_root` that were renamed in `src_root`. Renamed files below this threshold will be simply deleted in `dst_root` and their replacements created. A value of `None` will mean no files in `dst_root` will be eligible for renaming. (Defaults to `10000`.)
 		metadata_only (bool)   : Whether to use only metadata in determining which files in dst_root are the result of a rename. If set to False, `backup` will also compare the last 1kb of files. (Defaults to `False`.)
 		dry_run (bool)         : Whether to hold off performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console. (Defaults to `False`.)
@@ -81,14 +84,16 @@ def backup(src_root, dst_root, *, trash_root=None, only=[], ignore_missing=False
 		if trash_root is not None and not isinstance(trash_root, str):
 			msg = f"Bad type for arg 'trash_root' (expected str): {trash_root}"
 			raise TypeError(msg)
-		if not isinstance(exclude, list):
-			msg = f"Bad type for arg 'exclude' (expected list): {exclude}"
-			raise TypeError(msg)
-		if not isinstance(only, list):
-			msg = f"Bad type for arg 'only' (expected str): {only}"
+		if trash_root is None:
+			logger.warn("Trash flag (-t/--trash) present but no trash directory provided. Ignoring.")
+		if not isinstance(include, list):
+			msg = f"Bad type for arg 'include' (expected str): {include}"
 			raise TypeError(msg)
 		if not isinstance(ignore_missing, bool):
 			msg = f"Bad type for arg 'ignore_missing' (expected bool): {ignore_missing}"
+			raise TypeError(msg)
+		if not isinstance(exclude, list):
+			msg = f"Bad type for arg 'exclude' (expected list): {exclude}"
 			raise TypeError(msg)
 		if rename_threshold is not None and not isinstance(rename_threshold, int):
 			msg = f"Bad type for arg 'rename_threshold' (expected int): {rename_threshold}"
@@ -129,8 +134,8 @@ def backup(src_root, dst_root, *, trash_root=None, only=[], ignore_missing=False
 			msg = f"Chosen log already exists: {log_path}"
 			raise ValueError(msg)
 
-		src_files = _listdir(src_root, only, ignore_missing, exclude)
-		dst_files = _listdir(dst_root, only,           True, exclude)
+		src_files = _listdir(src_root, include, ignore_missing, exclude)
+		dst_files = _listdir(dst_root, include,           True, exclude)
 
 		if log_path == "-":
 			log_path = os.path.expanduser(os.path.join("~", f"py-backup.{timestamp}.log"))
@@ -138,7 +143,7 @@ def backup(src_root, dst_root, *, trash_root=None, only=[], ignore_missing=False
 		elif log_path:
 			log_manager.log_path = log_path
 
-		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {timestamp=} {exclude=} {only=} {ignore_missing=} {rename_threshold=} {dry_run=} {log_path=} {quiet=} {veryquiet=}")
+		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {timestamp=} {exclude=} {include=} {ignore_missing=} {rename_threshold=} {dry_run=} {log_path=} {quiet=} {veryquiet=}")
 
 		width = max(len(src_root), len(dst_root)) + 3
 		#logger.info("=" * width)
@@ -217,24 +222,55 @@ def backup(src_root, dst_root, *, trash_root=None, only=[], ignore_missing=False
 
 		return results
 
-def _listdir(root, only, ignore_missing, exclude):
+def _fnmatch(path, pattern):
+	if path.count(os.sep) != pattern.count(os.sep):
+		return False
+	return fnmatch(path, pattern)
+
+@lru_cache
+def _fnmatch_or_child(path, pattern):
+	if path.count(os.sep) < pattern.count(os.sep):
+		return False
+	path = path.split(os.sep)
+	pattern = pattern.split(os.sep)
+	for a,b in zip(path, pattern):
+		if not fnmatch(a, b):
+			return False
+	return True
+
+def _pattern(pat):
+	if "**" in pat:
+		raise ValueError(f"Recursive globs ('**') are not supported in pat arguments to include/exclude: {pat}")
+	if pat == ".." or pat.startswith(f"..{os.sep}") or f"{os.sep}..{os.sep}" in pat or pat.endswith(f"{os.sep}.."):
+		raise ValueError(f"Parent directories ('..') are not supported in pat arguments to include/exclude: {pat}")
+	if os.path.isabs(pat):
+		raise ValueError(f"Absolute paths are not supported as arguments to include/exclude: {path}")
+	pattern = SimpleNamespace()
+	pattern.trailing_slash = pat[-1] == "/" or pat[-1] == "\\"
+	pattern.current_dir    = pat.startswith("./") or pat.startswith(".\\")
+	pattern.extension      = "." in pat[1:-1] and pat[-1] != "."
+	pattern.pat            = os.path.normpath(pat)
+	pattern.multipart      = os.sep in pattern.pat
+	return pattern
+
+def _listdir(root, include, ignore_missing, exclude):
 	'''
 	Retrieves file relative paths, sizes, and mtimes for files inside a directory. (All "relative paths" are relative to `root`.)
 
-	If `only` is supplied, then the output will be a concatenation of `root` with each relative path in `only`.
+	If `include` is supplied, then the output will be a concatenation of `root` with each relative path in `include`.
 	Otherwise, the output will be a recursive listing of all files in `root`, excluding files indicated by `exclude`.
 
     Args
 		root (str)            : The directory to search.
-		only (list)           : A list of relative paths of files to include in the output. Wildcards are not supported at this time. (Defaults to `[]`.)
-		ignore_missing (bool) : Whether to ignore paths made using `only` that point to non-existent files. If False, this will raise a `ValueError` instead. (Defaults to `False`.)
+		include (list)        : A list of relative paths of files to include in the output. Wildcards are not supported at this time. (Defaults to `[]`.)
+		ignore_missing (bool) : Whether to ignore paths made using `include` that point to non-existent files. If False, this will raise a `ValueError` instead. (Defaults to `False`.)
 		exclude (list)        : A list of names and relative paths to ignore while searching recursively. (Defaults to `[]`.)
 
 	Returns
 		A SimpleNamespace containing two fields: `relpath_stats` and `empty_dirs`. `relpath_stats` is a `dict` with keys being each file's relative path and values being a `namedtuple` of file size (`size`) and modtime (`mtime`). `empty_dirs` is a set of relative paths to empty directories.
 
 	Raises
-		ValueError: If `ignore_missing` is `False` and any file indicated by a relative path in `only` does not exist.
+		ValueError: If `ignore_missing` is `False` and any file indicated by a relative path in `include` does not exist.
 	'''
 	Metadata = namedtuple("Metadata", ["size", "mtime"])
 
@@ -243,62 +279,202 @@ def _listdir(root, only, ignore_missing, exclude):
 	file_list.empty_dirs = set()
 	#file_list.nonempty_dirs = set()
 
-	if only:
+	if isinstance(include, str):
+		include = [include]
+	if isinstance(exclude, str):
+		exclude = [exclude]
 
-		if isinstance(only, str):
-			only = [only]
+	# categorize include patterns
+	include_dirnames  = set()
+	include_dirpaths  = set()
+	include_filenames = set()
+	include_filepaths = set()
+	for pat in include:
+		pattern = _pattern(pat)
+		if pattern.trailing_slash:
+			# dir only
+			if pattern.current_dir or pattern.multipart:
+				include_dirpaths.add(pattern.pat)
+			else:
+				include_dirnames.add(pattern.pat)
+		elif pattern.extension:
+			if pattern.current_dir or pattern.multipart:
+				include_filepaths.add(pattern.pat)
+			else:
+				include_filenames.add(pattern.pat)
+		else:
+			if pattern.current_dir or pattern.multipart:
+				include_dirpaths.add(pattern.pat)
+				include_filepaths.add(pattern.pat)
+			else:
+				include_dirnames.add(pattern.pat)
+				include_filenames.add(pattern.pat)
 
-		for relpath in only:
-			#if any(relpath.endswith(ft) for ft in exclude_filetypes):
-			#	continue
-			path = os.path.join(root, relpath)
-			if not os.path.isfile(path):
-				if ignore_missing:
-					continue
-				raise ValueError(path)
-			stats = os.stat(path)
-			file_list.relpath_stats[relpath] = Metadata(stats.st_size, stats.st_mtime)
-		return file_list
+	# categorize exclude patterns
+	exclude_dirnames  = set()
+	exclude_dirpaths  = set()
+	exclude_filenames = set()
+	exclude_filepaths = set()
+	for pat in exclude:
+		pattern = _pattern(pat)
+		if pattern.trailing_slash:
+			# dir only
+			if pattern.current_dir or pattern.multipart:
+				exclude_dirpaths.add(pattern.pat)
+			else:
+				exclude_dirnames.add(pattern.pat)
+		elif pattern.extension:
+			if pattern.current_dir or pattern.multipart:
+				exclude_filepaths.add(pattern.pat)
+			else:
+				exclude_filenames.add(pattern.pat)
+		else:
+			if pattern.current_dir or pattern.multipart:
+				exclude_dirpaths.add(pattern.pat)
+				exclude_filepaths.add(pattern.pat)
+			else:
+				exclude_dirnames.add(pattern.pat)
+				exclude_filenames.add(pattern.pat)
 
-	else:
+	# if treating all dirnames as dirpaths for including purposes
+	include_dirpaths |= include_dirnames
+	include_dirnames = set()
 
-		if isinstance(exclude, str):
-			exclude = [exclude]
+	# gather dirs for a narrow search
+	# if filename or dirname patterns exists then do a full scan
+	ancestors_of_included = set()
+	if not include_filenames and not include_dirnames:
+		for dir in include_dirpaths:
+			while dir:
+				ancestors_of_included.add(dir)
+				dir = os.path.dirname(dir)
+		for dir in include_filepaths:
+			while True:
+				dir = os.path.dirname(dir)
+				ancestors_of_included.add(dir)
+				if not dir:
+					break
 
-		exclude_files = set(f for f in exclude if not f.endswith(os.sep))
-		exclude_dirs  = set(f[:-1] if f.endswith(os.sep) else f for f in exclude)
+	logger.debug(f"{ancestors_of_included=}")
+	logger.debug(f"{include_dirnames=}")
+	logger.debug(f"{include_dirpaths=}")
+	logger.debug(f"{include_filenames=}")
+	logger.debug(f"{include_filepaths=}")
+	logger.debug(f"{exclude_dirnames=}")
+	logger.debug(f"{exclude_dirpaths=}")
+	logger.debug(f"{exclude_filenames=}")
+	logger.debug(f"{exclude_filepaths=}")
+	logger.debug(f"{ancestors_of_included=}")
+	logger.debug("***")
 
-		exclude_dirnames  = set(f for f in exclude_dirs if os.sep not in f)
-		exclude_dirpaths  = set(os.path.join(root, f) for f in exclude_dirs if os.sep in f)
-		exclude_filenames = set(f for f in exclude_files if os.sep not in f)
-		exclude_filepaths = set(os.path.join(root, f) for f in exclude_files if os.sep in f)
+	used_path_patterns = set()
 
-		for dir, dirnames, filenames in os.walk(root):
-			i = 0
-			while i < len(dirnames):
-				dirname = dirnames[i]
-				if any(fnmatch(dirname, pat) for pat in exclude_dirnames):
-					del dirnames[i]
-					i -= 1
-				else:
-					dir_relpath = os.path.relpath(os.path.join(dir, dirname), root)
-					if any(fnmatch(dir_relpath, pat) for pat in exclude_dirpaths):
-						del dirnames[i]
-						i -= 1
-				i += 1
-			dir_relpath = os.path.relpath(dir, root)
-			if not filenames and not dirnames:
-				file_list.empty_dirs.add(dir_relpath)
-			for filename in filenames:
-				if any(fnmatch(filename, pat) for pat in exclude_filenames):
-					continue
-				filepath = os.path.join(dir, filename)
-				if any(fnmatch(filepath, pat) for pat in exclude_filepaths):
-					continue
-				relpath = os.path.relpath(filepath, root)
-				stats = os.stat(filepath)
-				file_list.relpath_stats[relpath] = Metadata(stats.st_size, stats.st_mtime)
-		return file_list
+	in_included_relpath_dir = False
+	depth_in_included_relpath_dir = 9999
+
+	for dir, subdirnames, filenames in os.walk(root):
+		print("in " + dir)
+
+		# sorting may be needed if _listdir is changed to yield folder-by-folder
+		#subdirnames.sort()
+		#filenames.sort()
+
+		dirname     = os.path.basename(dir)
+		dir_relpath = os.path.relpath(dir, root)
+		depth       = dir_relpath.count(os.sep)
+
+		if depth <= depth_in_included_relpath_dir:
+			if any(_fnmatch_or_child(dir_relpath, pat) for pat in include_dirpaths):
+				in_included_relpath_dir = True
+				depth_in_included_relpath_dir = depth
+			else:
+				in_included_relpath_dir = False
+				depth_in_included_relpath_dir = 9999
+
+		# determine which dirpath pattern includes this dir, if any
+		# TODO? move into depth calc section
+		if not ignore_missing and depth == depth_in_included_relpath_dir:
+			for pat in include_dirpaths:
+				if _fnmatch(dir_relpath, pat): #okay to use fnmatch
+					used_path_patterns.add(pat)
+					break
+
+		# determine if we're in an explicitly included dir
+		# this may not be the case during full searches (i.e., searches with name patterns)
+		in_included_dir =	(in_included_relpath_dir) or \
+							(include_dirnames and any(_fnmatch(dirname, pat) for pat in include_dirnames))
+
+		# catalog empty directory
+		if not filenames and not subdirnames:
+			file_list.empty_dirs.add(dir_relpath)
+			continue
+		#else:
+		#	file_list.nonempty_dirs.add(dir_relpath)
+
+		# in case _listdir is given a recurse option
+		#if not recursive:
+		#	subdirnames[:] = []
+
+		# prune search tree
+		i = 0
+		while i < len(subdirnames):
+			# prune by excluded dir names
+			subdirname = subdirnames[i]
+			if any(_fnmatch(subdirname, pat) for pat in exclude_dirnames):
+				del subdirnames[i]
+				continue
+
+			# prune by excluded dir path
+			subdir_path = os.path.join(dir, subdirname)
+			subdir_relpath = os.path.relpath(subdir_path, root)
+			if any(_fnmatch(subdir_relpath, pat) for pat in exclude_dirpaths):
+				del subdirnames[i]
+				continue
+
+			# prune search tree during narrow searches (i.e., searches with only relpath patterns)
+			# paths need to be a child to a an included dir or a parent to an included entry (file or dir)
+			if not in_included_dir and ancestors_of_included and not any(_fnmatch(subdir_relpath, pat) for pat in ancestors_of_included):
+				del subdirnames[i]
+				continue
+			i += 1
+
+		for filename in filenames:
+			# prune by excluded file names
+			if any(_fnmatch(filename, pat) for pat in exclude_filenames):
+				continue
+
+			# prune by excluded file path
+			file_path = os.path.join(dir, filename)
+			file_relpath = os.path.relpath(file_path, root)
+			if any(_fnmatch(file_relpath, pat) for pat in exclude_filepaths):
+				continue
+
+			# determine if this is an explicitly included file
+			included_file = (include_filepaths and any(_fnmatch(file_relpath, pat) for pat in include_filepaths)) or \
+							(include_filenames and any(_fnmatch(filename, pat) for pat in include_filenames))
+
+			# determine which filepath pattern includes this file, if any
+			if not ignore_missing:
+				for pat in include_filepaths:
+					if _fnmatch(file_relpath, pat):
+						used_path_patterns.add(pat)
+						break
+
+			# ignore file if it is not specified by a file-select pattern or dir-select pattern
+			if include and not in_included_dir and not included_file:
+				continue
+
+			# file meets all criteria, add it to the return result
+			stats = os.stat(file_path)
+			file_list.relpath_stats[file_relpath] = Metadata(stats.st_size, stats.st_mtime)
+
+	# raise error if any explicitly included files were not found during the search, unless ignore_missing is True
+	if not ignore_missing:
+		unused_path_patterns = (include_dirpaths | include_filepaths) - used_path_patterns
+		if unused_path_patterns:
+			raise ValueError(f"Did not find these entries for backup: {unused_path_patterns}")
+
+	return file_list
 
 def _operations(src_files, dst_files, src_root, dst_root, trash_dir, rename_threshold, metadata_only):
 	src_relpath_stats = src_files.relpath_stats
@@ -583,10 +759,10 @@ class _ArgParser:
 	parser.add_argument("src_root", help="The root directory to copy files from.")
 	parser.add_argument("dst_root", help="The root directory to copy files to.")
 
-	parser.add_argument("--only", metavar="name_or_relpath", nargs="*", default=[], help="A whitelist of relative paths that will exclude all other files and directories from the backup. Wildcards are not supported at this time.")
-	parser.add_argument("-x", "--exclude", metavar="name_or_relpath", nargs="*", default=[], help=f"A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to entries in src_root and dst_root, except for those indicated by only. Entries ending with {os.sep} will be treated as a directory only.")
-	parser.add_argument("-t", "--trash-root", metavar="path", default=None, help="The root directory to place files that are 'deleted' from dst_root. Must be on the same filesystem as dst_root. Files will not be 'deleted' if this option is omitted.")
-	parser.add_argument("--ignore-missing", action="store_true", default=False, help="Indicate the relative paths indicated by --only may point to non-existent files.")
+	parser.add_argument("-i", "--include", metavar="name_or_relpath", nargs="*", default=[], help="A whitelist of relative paths that will exclude all other files and directories from the backup. Non-recursive globs (e.g., *.txt) are supported.")
+	parser.add_argument("-x", "--exclude", metavar="name_or_relpath", nargs="*", default=[], help=f"A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to entries in src_root and dst_root, except for those indicated by --include. Entries ending with {os.sep} will be treated as a directory only.")
+	parser.add_argument("-t", "--trash-root", metavar="path", nargs="?", default=None, help="The root directory to place files that are 'deleted' from dst_root. Must be on the same filesystem as dst_root. Files will not be 'deleted' if this option is omitted.")
+	parser.add_argument("--ignore-missing", action="store_true", default=False, help="Indicate the relative paths indicated by --include may point to non-existent files.")
 	parser.add_argument("-r", "--rename-threshold", metavar="size", type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root that were renamed in src_root. Renamed files below this threshold will be simply deleted in dst_root and their replacements created.")
 	parser.add_argument("-m", "--metadata_only", action="store_true", default=False, help="Use only metadata in determining which files in dst_root are the result of a rename. Otherwise, backup will also compare the last 1kb of files.")
 	parser.add_argument("--dry-run", action="store_true", default=False, help="Forgo performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console.")
@@ -620,7 +796,7 @@ def backup2(args):
 		args.dst_root,
 		trash_root       = args.trash_root,
 		exclude          = args.exclude,
-		only             = args.only,
+		include          = args.include,
 		ignore_missing   = args.ignore_missing,
 		rename_threshold = args.rename_threshold,
 		metadata_only    = args.metadata_only,
