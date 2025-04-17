@@ -44,7 +44,7 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 	Args
 		src_root (str)         : The root directory to copy files from.
 		dst_root (str)         : The root directory to copy files to.
-		trash_root (str)       : The root directory to place files that are "deleted" from `dst_root`. Files will not be "deleted" if this is `None`. (Defaults to `None`.)
+		trash_root (str)       : The root directory to place files that are "deleted" from `dst_root`. Must be on the same filesystem as `dst_root`. Files will not be "deleted" if this is `None`. (Defaults to `None`.)
 		only (list(str))       : A whitelist of file relative paths that will exclude all other files and directories from the backup. Mutually exclusive with the `exclude` parameter. (Defaults to `[]`.)
 		exclude (list(str))    : A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to both `src_root` and `dst_root`. Entries ending with `os.sep` will be treated as a directory only. Mutually exclusive with the `only` parameter. (Defaults to `[]`.)
 		ignore_missing (bool)  : Whether the relative paths indicated by `only` may point to non-existent files. (Defaults to `False`.)
@@ -64,6 +64,8 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 
 	if veryquiet:
 		quiet = True
+	timestamp = str(int(time.time()*1000))
+	trash_dir = os.path.join(trash_root, timestamp) if trash_root else None
 
 	if not isinstance(src_root, str):
 		msg = f"Bad type for arg 'src_root' (expected str): {src_root}"
@@ -109,11 +111,11 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 		msg = f"Chosen dst_root is not a directory: {dst_root}"
 		raise ValueError(msg)
 	if trash_root is not None and os.path.exists(trash_root):
-		if not os.path.isdir(trash_root):
-			msg = f"Chosen trash_root is not a directory: {trash_root}"
-			raise ValueError(msg)
 		if os.stat(trash_root).st_dev != os.stat(dst_root).st_dev:
 			msg = f"Chosen trash_root is not on the same filesystem as dst_root: {trash_root}"
+			raise ValueError(msg)
+		if os.path.exists(trash_dir) and not os.path.isdir(trash_dir):
+			msg = f"Could not create trash folder {timestamp} in trash_root: {trash_root}"
 			raise ValueError(msg)
 	if rename_threshold is not None and rename_threshold < 0:
 		msg = f"rename_threshold must be non-negative: {rename_threshold}"
@@ -122,8 +124,8 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 		msg = f"Chosen log already exists: {log_path}"
 		raise ValueError(msg)
 
-	with _LogManager(log_path, suppress_stdout=quiet, suppress_stderr=veryquiet):
-		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {exclude=} {only=} {ignore_missing=} {rename_threshold=} {dry_run=} {log_path=} {quiet=} {veryquiet=}")
+	with _LogManager(log_path, timestamp=timestamp, suppress_stdout=quiet, suppress_stderr=veryquiet):
+		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {timestamp=} {exclude=} {only=} {ignore_missing=} {rename_threshold=} {dry_run=} {log_path=} {quiet=} {veryquiet=}")
 		results = Results()
 
 		width = max(len(src_root), len(dst_root)) + 3
@@ -190,10 +192,10 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 					continue
 
 		# Deleting must be done first or backing up a.jpg -> a.JPG (or similar) on Windows will fail
-		if trash_root:
+		if trash_dir:
 			for dst_relpath in dst_only_relpaths:
-				src = os.path.join(  dst_root, dst_relpath)
-				dst = os.path.join(trash_root, dst_relpath)
+				src = os.path.join( dst_root, dst_relpath)
+				dst = os.path.join(trash_dir, dst_relpath)
 				logger.info(f"- {dst_relpath}")
 				if not dry_run:
 					try:
@@ -449,7 +451,7 @@ class _ConsoleHandler(logging.Handler):
 					sys.stderr.write(err)
 
 class _LogManager:
-	def __init__(self, log_path ,*, suppress_stdout=False, suppress_stderr=False):
+	def __init__(self, log_path ,*, timestamp, suppress_stdout, suppress_stderr):
 		self.log_path = log_path
 		self.final_log_path = log_path
 		self.log_handler_file = None
@@ -463,7 +465,7 @@ class _LogManager:
 		if self.log_path == "-":
 			with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmp_log:
 				self.log_path = tmp_log.name
-			self.final_log_path = os.path.expanduser(os.path.join("~", f"py-backup.{int(time.time()*1000)}.log"))
+			self.final_log_path = os.path.expanduser(os.path.join("~", f"py-backup.{timestamp}.log"))
 		if self.log_path:
 			formatter = logging.Formatter("%(levelname)s: %(message)s")
 			self.log_handler_file = logging.FileHandler(self.log_path)
@@ -508,7 +510,7 @@ class _ArgParser:
 	group.add_argument("--only", metavar="name_or_relpath", nargs="+", default=[], help="A whitelist of file relative paths that will exclude all other files and directories from the backup. Mutually exclusive with --exclude.")
 	group.add_argument("-x", "--exclude", metavar="name_or_relpath", nargs="+", default=[], help=f"A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to both src_root and dst_root. Entries ending with {os.sep} will be treated as a directory only. Mutually exclusive with --only.")
 
-	parser.add_argument("-t", "--trash-root", metavar="path", default=None, help="A root directory to place files that are 'deleted' from dst_root. Must be in the same filesystem as dst_root. Files will not be 'deleted' if this option is omitted.")
+	parser.add_argument("-t", "--trash-root", metavar="path", default=None, help="The root directory to place files that are 'deleted' from dst_root. Must be on the same filesystem as dst_root. Files will not be 'deleted' if this option is omitted.")
 	parser.add_argument("--ignore-missing", action="store_true", default=False, help="Indicate the relative paths indicated by --only may point to non-existent files.")
 	parser.add_argument("-r", "--rename-threshold", metavar="size", type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root that were renamed in src_root. Renamed files below this threshold will be simply deleted in dst_root and their replacements created.")
 
