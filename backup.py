@@ -1,7 +1,8 @@
 # Copyright (c) 2025 Joe Walter
 
-# TODO break backup() into parts: 1. list files, 2. create +/-/R/U subsets, 3. perform operations
-# TODO test cases for above
+# TODO delete empty dirs in dst_root
+# TODO --allow-empty-dirs to create empty dirs in dst_root if they exist in src_root
+# TODO test cases
 # TODO write a method to do backup()s in stages for large directories
 
 import sys
@@ -31,7 +32,7 @@ class Results:
 		self.rename_error = 0
 		self.update_error = 0
 		self.delete_error = 0
-		self.diff_bytes = 0
+		self.byte_diff = 0
 
 	@property
 	def errors(self):
@@ -126,7 +127,6 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 
 	with _LogManager(log_path, timestamp=timestamp, suppress_stdout=quiet, suppress_stderr=veryquiet):
 		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {timestamp=} {exclude=} {only=} {ignore_missing=} {rename_threshold=} {dry_run=} {log_path=} {quiet=} {veryquiet=}")
-		results = Results()
 
 		width = max(len(src_root), len(dst_root)) + 3
 		#logger.info("=" * width)
@@ -134,119 +134,62 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 		logger.info("-> " + dst_root)
 		logger.info("-" * width)
 
+		src_files = _listdir(src_root, exclude, only, ignore_missing)
+		dst_files = _listdir(dst_root, exclude, only, ignore_missing)
+
 		if not dry_run:
 			os.makedirs(dst_root, exist_ok=True)
 
-		src_relpath_stats = _listdir(src_root, exclude=exclude, only=only, ignore_missing=ignore_missing)
-		dst_relpath_stats = _listdir(dst_root, exclude=exclude, only=only, ignore_missing=ignore_missing)
+		results = Results()
 
-		src_relpaths = set(src_relpath_stats.keys())
-		dst_relpaths = set(dst_relpath_stats.keys())
+		for op, src, dst, byte_diff, summary in _operations(src_files, dst_files, src_root, dst_root, trash_dir, rename_threshold, metadata_only):
+			logger.info(summary)
 
-		src_only_relpaths = sorted(src_relpaths.difference(dst_relpaths))
-		dst_only_relpaths = sorted(dst_relpaths.difference(src_relpaths))
-		both_relpaths     = sorted(src_relpaths.intersection(dst_relpaths))
-
-		if rename_threshold is not None:
-			src_only_relpath_from_stats = _reverse_dict({path:src_relpath_stats[path] for path in src_only_relpaths})
-			dst_only_relpath_from_stats = _reverse_dict({path:dst_relpath_stats[path] for path in dst_only_relpaths})
-			
-			for dst_relpath in dst_only_relpaths:
-				if dst_relpath_stats[dst_relpath][0] < rename_threshold:
-					# Ignore renaming small files
-					continue
-				try:
-					rename_to = src_only_relpath_from_stats[dst_relpath_stats[dst_relpath]]
-					if rename_to is None:
-						# dst file may be the result of a rename, but there are multiple candidates
-						continue
-					rename_from = dst_only_relpath_from_stats[dst_relpath_stats[dst_relpath]]
-					if rename_from is None:
-						# dst file may be the result of a rename, but there are multiple candidates
-						continue
-					
-					# compare last 1kb
-					if not metadata_only:
-						on_dst = os.path.join(dst_root, rename_from)
-						on_src = os.path.join(src_root, rename_to)
-						if not _last_bytes(on_src) == _last_bytes(on_dst):
-							continue
-					
-					logger.info(f"R {rename_from} -> {rename_to}")
-					src_only_relpaths.remove(rename_to)
-					dst_only_relpaths.remove(rename_from)
-					
-					#rename
-					if not dry_run:
-						src = os.path.join(dst_root, rename_from)
-						dst = os.path.join(dst_root, rename_to)
-						try:
-							_move(src, dst)
-							results.rename_success += 1
-						except OSError as e:
-							results.rename_error += 1
-							logger.error(f"{e.__class__.__name__}: R {src} -> {dst}", extra={})
-					
-				except KeyError:
-					# dst file not a result of a rename
-					continue
-
-		# Deleting must be done first or backing up a.jpg -> a.JPG (or similar) on Windows will fail
-		if trash_dir:
-			for dst_relpath in dst_only_relpaths:
-				src = os.path.join( dst_root, dst_relpath)
-				dst = os.path.join(trash_dir, dst_relpath)
-				logger.info(f"- {dst_relpath}")
-				if not dry_run:
+			if not dry_run:
+				if op == "-":
 					try:
 						_move(src, dst)
 						results.delete_success += 1
-						results.diff_bytes -= dst_relpath_stats[dst_relpath][0]
+						results.byte_diff += byte_diff
 					except OSError as e:
 						results.delete_error += 1
 						logger.error(f"{e.__class__.__name__}: - {dst}")
-
-		for src_relpath in src_only_relpaths:
-			src = os.path.join(src_root, src_relpath)
-			dst = os.path.join(dst_root, src_relpath)
-			logger.info(f"+ {src_relpath}")
-			if not dry_run:
-				try:
-					_copy(src, dst)
-					results.create_success += 1
-					results.diff_bytes += src_relpath_stats[src_relpath].size
-				except OSError as e:
-					results.create_error += 1
-					logger.error(f"{e.__class__.__name__}: + {dst}")
-
-		for relpath in both_relpaths:
-			src = os.path.join(src_root, relpath)
-			dst = os.path.join(dst_root, relpath)
-			src_time = src_relpath_stats[relpath].mtime
-			dst_time = dst_relpath_stats[relpath].mtime
-			if src_time > dst_time:
-				logger.info(f"U {relpath}")
-				if not dry_run:
+				elif op == "+":
+					try:
+						_copy(src, dst)
+						results.create_success += 1
+						results.byte_diff += byte_diff
+					except OSError as e:
+						results.create_error += 1
+						logger.error(f"{e.__class__.__name__}: + {dst}")
+				elif op == "U":
 					try:
 						_copy(src, dst)
 						results.update_success += 1
-						results.diff_bytes += src_relpath_stats[relpath].size - dst_relpath_stats[relpath].size
+						results.byte_diff += byte_diff
 					except OSError as e:
 						results.update_error += 1
 						logger.error(f"{e.__class__.__name__}: U {dst}")
-			elif src_time < dst_time:
-				logger.warn(f"Working copy is older than backed-up copy, skipping: {src}")
+				elif op == "R":
+					try:
+						_move(src, dst)
+						results.rename_success += 1
+					except OSError as e:
+						results.rename_error += 1
+						logger.error(f"{e.__class__.__name__}: R {src} -> {dst}", extra={})
+				else:
+					assert False
 
 		logger.info("")
 		logger.info(f"Rename Success: {results.rename_success}" + (f" / Failed: {results.rename_error}" if results.rename_error else ""))
 		logger.info(f"Create Success: {results.create_success}" + (f" / Failed: {results.create_error}" if results.create_error else ""))
 		logger.info(f"Update Success: {results.update_success}" + (f" / Failed: {results.update_error}" if results.update_error else ""))
 		logger.info(f"Delete Success: {results.delete_success}" + (f" / Failed: {results.delete_error}" if results.delete_error else ""))
-		logger.info(f"Net Change in Bytes: {_human_readable_size(results.diff_bytes)}")
+		logger.info(f"Net Change in Bytes: {_human_readable_size(results.byte_diff)}")
 
 		return results
 
-def _listdir(root, *, exclude=[], only=[], ignore_missing=False):
+def _listdir(root, exclude, only, ignore_missing):
 	'''
 	Retrieves file relative paths, sizes, and mtimes for files inside a directory. (All "relative paths" are relative to `root`.)
 
@@ -268,7 +211,7 @@ def _listdir(root, *, exclude=[], only=[], ignore_missing=False):
 
 	Metadata = namedtuple("Metadata", ["size", "mtime"])
 
-	relpaths = {}
+	relpath_stats = {}
 
 	if only:
 
@@ -284,8 +227,8 @@ def _listdir(root, *, exclude=[], only=[], ignore_missing=False):
 					continue
 				raise FileNotFoundError(path)
 			stats = os.stat(path)
-			relpaths[relpath] = (stats.st_size, stats.st_mtime)
-		return relpaths
+			relpath_stats[relpath] = (stats.st_size, stats.st_mtime)
+		return relpath_stats
 
 	else:
 
@@ -321,8 +264,78 @@ def _listdir(root, *, exclude=[], only=[], ignore_missing=False):
 					continue
 				relpath = os.path.relpath(filepath, root)
 				stats = os.stat(filepath)
-				relpaths[relpath] = Metadata(stats.st_size, stats.st_mtime)
-		return relpaths
+				relpath_stats[relpath] = Metadata(stats.st_size, stats.st_mtime)
+		return relpath_stats
+
+def _operations(src_relpath_stats, dst_relpath_stats, src_root, dst_root, trash_dir, rename_threshold, metadata_only):
+	src_relpaths = set(src_relpath_stats.keys())
+	dst_relpaths = set(dst_relpath_stats.keys())
+
+	src_only_relpaths = sorted(src_relpaths.difference(dst_relpaths))
+	dst_only_relpaths = sorted(dst_relpaths.difference(src_relpaths))
+	both_relpaths     = sorted(src_relpaths.intersection(dst_relpaths))
+
+	if rename_threshold is not None:
+		src_only_relpath_from_stats = _reverse_dict({path:src_relpath_stats[path] for path in src_only_relpaths})
+		dst_only_relpath_from_stats = _reverse_dict({path:dst_relpath_stats[path] for path in dst_only_relpaths})
+
+		for dst_relpath in dst_only_relpaths:
+			# Ignore small files
+			if dst_relpath_stats[dst_relpath][0] < rename_threshold:
+				continue
+			try:
+				rename_to = src_only_relpath_from_stats[dst_relpath_stats[dst_relpath]]
+				# Ignore if there are multiple candidates
+				if rename_to is None:
+					continue
+				rename_from = dst_only_relpath_from_stats[dst_relpath_stats[dst_relpath]]
+				# Ignore if there are multiple candidates
+				if rename_from is None:
+					continue
+
+				# Ignore if last 1kb do not match
+				if not metadata_only:
+					on_dst = os.path.join(dst_root, rename_from)
+					on_src = os.path.join(src_root, rename_to)
+					if not _last_bytes(on_src) == _last_bytes(on_dst):
+						continue
+
+				src = os.path.join(dst_root, rename_from)
+				dst = os.path.join(dst_root, rename_to)
+
+				src_only_relpaths.remove(rename_to)
+				dst_only_relpaths.remove(rename_from)
+
+				yield ("R", src, dst, 0, f"R {rename_from} -> {rename_to}")
+
+			except KeyError:
+				# dst file not a result of a rename
+				continue
+
+	# Deleting must be done first or backing up a.jpg -> a.JPG (or similar) on Windows will fail
+	if trash_dir:
+		for dst_relpath in dst_only_relpaths:
+			src = os.path.join( dst_root, dst_relpath)
+			dst = os.path.join(trash_dir, dst_relpath)
+			byte_diff = -dst_relpath_stats[dst_relpath][0]
+			yield ("-", src, dst, byte_diff, f"- {dst_relpath}")
+
+	for src_relpath in src_only_relpaths:
+		src = os.path.join(src_root, src_relpath)
+		dst = os.path.join(dst_root, src_relpath)
+		byte_diff = src_relpath_stats[src_relpath].size
+		yield ("+", src, dst, byte_diff, f"+ {src_relpath}")
+
+	for relpath in both_relpaths:
+		src = os.path.join(src_root, relpath)
+		dst = os.path.join(dst_root, relpath)
+		byte_diff = src_relpath_stats[relpath].size - dst_relpath_stats[relpath].size
+		src_time = src_relpath_stats[relpath].mtime
+		dst_time = dst_relpath_stats[relpath].mtime
+		if src_time > dst_time:
+			yield ("U", src, dst, byte_diff, f"U {relpath}")
+		elif src_time < dst_time:
+			logger.warn(f"Working copy is older than backed-up copy, skipping update: {relpath}")
 
 def _copy(src, dst):
 	'''Copy src to dst, keeping metadata, and overwriting any existing file.'''
