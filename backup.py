@@ -3,7 +3,6 @@
 # TODO break backup() into parts: 1. list files, 2. create +/-/R/U subsets, 3. perform operations
 # TODO test cases for above
 # TODO write a method to do backup()s in stages for large directories
-# TODO auto-accept renames?
 
 import sys
 import argparse
@@ -38,7 +37,7 @@ class Results:
 	def errors(self):
 		return self.create_error + self.rename_error + self.update_error + self.delete_error
 
-def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_missing=False, rename_threshold=20000, ans=None, dry_run=False, log_path="-", quiet=False, veryquiet=False):
+def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_missing=False, rename_threshold=10000, metadata_only=False, dry_run=False, log_path="-", quiet=False, veryquiet=False):
 	'''
 	Copies new and updated files from `src_root` to `dst_root`, and optionally "deletes" files from `dst_root` if they are not present in `src_root` (they will be moved into `trash_root`, preserving directory structure). Furthermore, files that exist in `dst_root` but renamed in `src_root` may be renamed in `dst_root` to match. Candidates for rename are discovered by searching for files with an identical metadata signature, consisting of file size and modification time. These candidates must be above a minimum size threshold (`rename_threshold`) and have an unambiguously unique metadata signature within their respective root directories. The user is asked to confirm these renames before they are committed.
 
@@ -49,8 +48,8 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 		only (list(str))       : A whitelist of file relative paths that will exclude all other files and directories from the backup. Mutually exclusive with the `exclude` parameter. (Defaults to `[]`.)
 		exclude (list(str))    : A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to both `src_root` and `dst_root`. Entries ending with `os.sep` will be treated as a directory only. Mutually exclusive with the `only` parameter. (Defaults to `[]`.)
 		ignore_missing (bool)  : Whether the relative paths indicated by `only` may point to non-existent files. (Defaults to `False`.)
-		rename_threshold (int) : The minimum size in bytes needed to consider renaming files in `dst_root` that were renamed in `src_root`. Renamed files below this threshold will be simply deleted in `dst_root` and their replacements created. A value of `None` will mean no files in `dst_root` will be eligible for renaming. (Defaults to `20000`.)
-		ans (str)              : How to respond when asked to accept proposed renames. Used mostly for testing. (Defaults to `None`.)
+		rename_threshold (int) : The minimum size in bytes needed to consider renaming files in `dst_root` that were renamed in `src_root`. Renamed files below this threshold will be simply deleted in `dst_root` and their replacements created. A value of `None` will mean no files in `dst_root` will be eligible for renaming. (Defaults to `10000`.)
+		metadata_only (bool)   : Whether to use only metadata in determining which files in dst_root are the result of a rename. If set to False, `backup` will also compare the last 1kb of files. (Defaults to `False`.)
 		dry_run (bool)         : Whether to hold off performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console. (Defaults to `False`.)
 		log_path (str)         : File to write log messages to. A falsy value means no log will be created. A value of '-' means a tempfile will be used for the log, and it will be copied to the user's home directory after the backup is done. (Defaults to '-'.)
 		quiet (bool)           : Whether to forgo printing to stdout.
@@ -84,11 +83,11 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 	if not isinstance(ignore_missing, bool):
 		msg = f"Bad type for arg 'ignore_missing' (expected bool): {ignore_missing}"
 		raise TypeError(msg)
-	if not isinstance(rename_threshold, int):
+	if rename_threshold is not None and not isinstance(rename_threshold, int):
 		msg = f"Bad type for arg 'rename_threshold' (expected int): {rename_threshold}"
 		raise TypeError(msg)
-	if ans is not None and not isinstance(ans, str):
-		msg = f"Bad type for arg 'ans' (expected str): {ans}"
+	if not isinstance(metadata_only, bool):
+		msg = f"Bad type for arg 'metadata_only' (expected bool): {metadata_only}"
 		raise TypeError(msg)
 	if not isinstance(dry_run, bool):
 		msg = f"Bad type for arg 'dry_run' (expected bool): {dry_run}"
@@ -116,20 +115,15 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 		if os.stat(trash_root).st_dev != os.stat(dst_root).st_dev:
 			msg = f"Chosen trash_root is not on the same filesystem as dst_root: {trash_root}"
 			raise ValueError(msg)
+	if rename_threshold is not None and rename_threshold < 0:
+		msg = f"rename_threshold must be non-negative: {rename_threshold}"
+		raise ValueError(msg)
 	if log_path is not None and os.path.exists(log_path):
 		msg = f"Chosen log already exists: {log_path}"
 		raise ValueError(msg)
-	if rename_threshold < 0:
-		msg = f"rename_threshold must be non-negative: {rename_threshold}"
-		raise ValueError(msg)
-	if ans not in [None, "", "Y", "y", "N", "n"]:
-		msg = f"Unrecognized answer: {ans}"
-		raise ValueError(msg)
-	if quiet and ans is None:
-		msg = f"Arg 'ans' must be given in quiet mode"
-		raise ValueError(msg)
 
 	with _LogManager(log_path, suppress_stdout=quiet, suppress_stderr=veryquiet):
+		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {exclude=} {only=} {ignore_missing=} {rename_threshold=} {dry_run=} {log_path=} {quiet=} {veryquiet=}")
 		results = Results()
 
 		width = max(len(src_root), len(dst_root)) + 3
@@ -151,12 +145,10 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 		dst_only_relpaths = sorted(dst_relpaths.difference(src_relpaths))
 		both_relpaths     = sorted(src_relpaths.intersection(dst_relpaths))
 
-		if rename_threshold is not None and ans not in ["n", "N"]:
-			proposed_renames = []
+		if rename_threshold is not None:
 			src_only_relpath_from_stats = _reverse_dict({path:src_relpath_stats[path] for path in src_only_relpaths})
 			dst_only_relpath_from_stats = _reverse_dict({path:dst_relpath_stats[path] for path in dst_only_relpaths})
-			src_only_relpaths_with_renames = src_only_relpaths.copy()
-			dst_only_relpaths_with_renames = dst_only_relpaths.copy()
+			
 			for dst_relpath in dst_only_relpaths:
 				if dst_relpath_stats[dst_relpath][0] < rename_threshold:
 					# Ignore renaming small files
@@ -170,44 +162,32 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 					if rename_from is None:
 						# dst file may be the result of a rename, but there are multiple candidates
 						continue
-					src_only_relpaths_with_renames.remove(rename_to)
-					dst_only_relpaths_with_renames.remove(rename_from)
-					proposed_renames.append((rename_from, rename_to))
+					
+					# compare last 1kb
+					if not metadata_only:
+						on_dst = os.path.join(dst_root, rename_from)
+						on_src = os.path.join(src_root, rename_to)
+						if not _last_bytes(on_src) == _last_bytes(on_dst):
+							continue
+					
+					logger.info(f"R {rename_from} -> {rename_to}")
+					src_only_relpaths.remove(rename_to)
+					dst_only_relpaths.remove(rename_from)
+					
+					#rename
+					if not dry_run:
+						src = os.path.join(dst_root, rename_from)
+						dst = os.path.join(dst_root, rename_to)
+						try:
+							_move(src, dst)
+							results.rename_success += 1
+						except OSError as e:
+							results.rename_error += 1
+							logger.error(f"{e.__class__.__name__}: R {src} -> {dst}", extra={})
+					
 				except KeyError:
 					# dst file not a result of a rename
 					continue
-
-			if proposed_renames:
-				for rename_from, rename_to in proposed_renames:
-					print(f"R {rename_from} -> {rename_to}")
-				if ans is None:
-					print("Accept these renames? [y] yes, then continue (default)  [Y] yes, then quit  [n] no, then continue  [N] no, and quit")
-					ans = input("> ").strip()
-				if ans == "":
-					ans = "y"
-				if ans == "N":
-					print("Rejecting renames and quitting.")
-					return
-
-				# If renames are accepted
-				if ans == "y" or ans == "Y":
-					src_only_relpaths = src_only_relpaths_with_renames
-					dst_only_relpaths = dst_only_relpaths_with_renames
-
-					if not dry_run:
-						for rename_from, rename_to in proposed_renames:
-							src = os.path.join(dst_root, rename_from)
-							dst = os.path.join(dst_root, rename_to)
-							try:
-								_move(src, dst)
-								results.rename_success += 1
-							except OSError as e:
-								results.rename_error += 1
-								logger.error(f"{e.__class__.__name__}: R {src} -> {dst}", extra={})
-
-				if ans == "Y":
-					results.print_footer()
-					return
 
 		# Deleting must be done first or backing up a.jpg -> a.JPG (or similar) on Windows will fail
 		if trash_root:
@@ -401,6 +381,13 @@ def _move(src, dst, *, delete_empty_dirs=True):
 		#except OSError:
 		#	pass
 
+def _last_bytes(file_path, n=1024):
+	file_size = os.path.getsize(file_path)
+	bytes_to_read = file_size if n > file_size else n
+	with open(file_path, "rb") as f:
+		f.seek(-bytes_to_read, os.SEEK_END)
+		return f.read()
+
 def _human_readable_size(num_bytes):
 	units = ["bytes", "KB", "MB", "GB", "TB", "PB"]
 	i = 0
@@ -521,22 +508,18 @@ class _ArgParser:
 	group.add_argument("--only", metavar="name_or_relpath", nargs="+", default=[], help="A whitelist of file relative paths that will exclude all other files and directories from the backup. Mutually exclusive with --exclude.")
 	group.add_argument("-x", "--exclude", metavar="name_or_relpath", nargs="+", default=[], help=f"A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to both src_root and dst_root. Entries ending with {os.sep} will be treated as a directory only. Mutually exclusive with --only.")
 
-	parser.add_argument("-t", "--trash-root", metavar="path", default=None, help="The root directory to place files that are 'deleted' from dst_root. Must be in the same filesystem as dst_root. Files will not be 'deleted' if this option is omitted.")
-	parser.add_argument("--ignore-missing", action="store_true", default=False, help="Whether the relative paths indicated by --only may point to non-existent files.")
+	parser.add_argument("-t", "--trash-root", metavar="path", default=None, help="A root directory to place files that are 'deleted' from dst_root. Must be in the same filesystem as dst_root. Files will not be 'deleted' if this option is omitted.")
+	parser.add_argument("--ignore-missing", action="store_true", default=False, help="Indicate the relative paths indicated by --only may point to non-existent files.")
 	parser.add_argument("-r", "--rename-threshold", metavar="size", type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root that were renamed in src_root. Renamed files below this threshold will be simply deleted in dst_root and their replacements created.")
 
-	group = parser.add_mutually_exclusive_group(required=False)
-	group.add_argument("--ans", choices=["y","Y","n","N"], default=None, help="How to respond when asked to accept proposed renames. Options are 'y' = yes, then continue, 'Y' = yes, then quit, 'n' = no, then continue, and 'N' = no, and quit.")
-	group.add_argument("-y", action="store_true", default=False, help="Shorthand for '--ans y'.")
-	group.add_argument("-n", action="store_true", default=False, help="Shorthand for '--ans n'.")
-
-	parser.add_argument("--dry-run", action="store_true", default=False, help="Whether to hold off performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console.")
+	parser.add_argument("-m", "--metadata_only", action="store_true", default=False, help="Use only metadata in determining which files in dst_root are the result of a rename. Otherwise, backup will also compare the last 1kb of files.")
+	parser.add_argument("--dry-run", action="store_true", default=False, help="Forgo performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console.")
 
 	group = parser.add_mutually_exclusive_group(required=False)
 	group.add_argument("--log", metavar="path", type=str, default="-", help="File to write log messages to. If this is not supplied, a tempfile will be used for the log, and it will be moved to the user's home directory after the backup is done.")
-	group.add_argument("--no-log", action="store_true", help="Whether to forgo writing to a log.")
+	group.add_argument("--no-log", action="store_true", help="Forgo writing to a log.")
 
-	parser.add_argument("-q", action="count", default=0, help="Whether to forgo printing to stdout (-q) and stderr (-qq).")
+	parser.add_argument("-q", action="count", default=0, help="Forgo printing to stdout (-q) and stderr (-qq).")
 
 	@staticmethod
 	def parse(args):
@@ -544,13 +527,10 @@ class _ArgParser:
 			args = args.split()
 		args = _ArgParser.parser.parse_args(args)
 
-		ans            = args.ans or ("y" if args.y else None) or ("n" if args.n else None)
 		args.log_path  = None if args.no_log else args.log
 		args.quiet     = args.q >= 1
 		args.veryquiet = args.q >= 2
 
-		del args.y
-		del args.n
 		del args.no_log
 		del args.log
 		del args.q
@@ -567,7 +547,7 @@ def backup2(args):
 		only             = args.only,
 		ignore_missing   = args.ignore_missing,
 		rename_threshold = args.rename_threshold,
-		ans              = args.ans,
+		metadata_only    = args.metadata_only,
 		dry_run          = args.dry_run,
 		log_path         = args.log_path,
 		quiet            = args.quiet,
