@@ -354,14 +354,6 @@ def _listdir(root, include, ignore_missing, exclude):
 				if not dir:
 					break
 
-	# determine how deep a scan is necessary
-	# TODO depth can change based on current dir
-	if include and not include_dirnames and not include_dirpaths and not include_filenames:
-		max_depth = max(pat.count(os.sep) for pat in include) + 1
-	else:
-		max_depth = 9999
-
-	logger.debug(f"{max_depth=}")
 	logger.debug(f"{ancestors_of_included=}")
 	logger.debug(f"{include_dirnames=}")
 	logger.debug(f"{include_dirpaths=}")
@@ -417,10 +409,6 @@ def _listdir(root, include, ignore_missing, exclude):
 			continue
 		#else:
 		#	file_list.nonempty_dirs.add(dir_relpath)
-
-		# do not recurse if dir is as deep as the deepest 'include' file pattern, which are all relpaths
-		if depth == max_depth:
-			subdirnames[:] = []
 
 		# in case _listdir is given a recurse option
 		#if not recursive:
