@@ -1,8 +1,8 @@
 # Copyright (c) 2025 Joe Walter
 
-# TODO delete empty dirs in dst_root
-# TODO --allow-empty-dirs to create empty dirs in dst_root if they exist in src_root
-# TODO test cases
+# TODO Backup class to reduce arg passing (_listdir is an issue b/c it takes two sets of args depending on the root to search)
+# TODO wildcards in `only`
+# TODO testing
 # TODO write a method to do backup()s in stages for large directories
 
 import sys
@@ -11,13 +11,14 @@ import os
 import io
 import stat
 import shutil
-import fnmatch
-import traceback
-import tempfile
 import logging
+import tempfile
 import time
+import traceback
+from fnmatch import fnmatch
 from collections import Counter
 from collections import namedtuple
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -35,10 +36,10 @@ class Results:
 		self.byte_diff = 0
 
 	@property
-	def errors(self):
+	def err_count(self):
 		return self.create_error + self.rename_error + self.update_error + self.delete_error
 
-def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_missing=False, rename_threshold=10000, metadata_only=False, dry_run=False, log_path="-", quiet=False, veryquiet=False):
+def backup(src_root, dst_root, *, trash_root=None, only=[], ignore_missing=False, exclude=[], rename_threshold=10000, metadata_only=False, dry_run=False, log_path="-", quiet=False, veryquiet=False):
 	'''
 	Copies new and updated files from `src_root` to `dst_root`, and optionally "deletes" files from `dst_root` if they are not present in `src_root` (they will be moved into `trash_root`, preserving directory structure). Furthermore, files that exist in `dst_root` but renamed in `src_root` may be renamed in `dst_root` to match. Candidates for rename are discovered by searching for files with an identical metadata signature, consisting of file size and modification time. These candidates must be above a minimum size threshold (`rename_threshold`) and have an unambiguously unique metadata signature within their respective root directories. The user is asked to confirm these renames before they are committed.
 
@@ -46,9 +47,9 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 		src_root (str)         : The root directory to copy files from.
 		dst_root (str)         : The root directory to copy files to.
 		trash_root (str)       : The root directory to place files that are "deleted" from `dst_root`. Must be on the same filesystem as `dst_root`. Files will not be "deleted" if this is `None`. (Defaults to `None`.)
-		only (list(str))       : A whitelist of file relative paths that will exclude all other files and directories from the backup. Mutually exclusive with the `exclude` parameter. (Defaults to `[]`.)
-		exclude (list(str))    : A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to both `src_root` and `dst_root`. Entries ending with `os.sep` will be treated as a directory only. Mutually exclusive with the `only` parameter. (Defaults to `[]`.)
-		ignore_missing (bool)  : Whether the relative paths indicated by `only` may point to non-existent files. (Defaults to `False`.)
+		only (list(str))       : A whitelist of relative paths that will exclude all other files and directories from the backup. Wildcards are not supported at this time. (Defaults to `[]`.)
+		ignore_missing (bool)  : Whether the relative paths indicated by `only` may point to non-existent files in `src_root`. (Defaults to `False`.)
+		exclude (list(str))    : A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to entries in `src_root` and `dst_root`, except for those indicated by `only`. Entries ending with `os.sep` will be treated as a directory only. (Defaults to `[]`.)
 		rename_threshold (int) : The minimum size in bytes needed to consider renaming files in `dst_root` that were renamed in `src_root`. Renamed files below this threshold will be simply deleted in `dst_root` and their replacements created. A value of `None` will mean no files in `dst_root` will be eligible for renaming. (Defaults to `10000`.)
 		metadata_only (bool)   : Whether to use only metadata in determining which files in dst_root are the result of a rename. If set to False, `backup` will also compare the last 1kb of files. (Defaults to `False`.)
 		dry_run (bool)         : Whether to hold off performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console. (Defaults to `False`.)
@@ -62,70 +63,81 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 	Returns
 		A `Results` object containing various statistics.
 	'''
+	with _LogManager(suppress_stdout=quiet, suppress_stderr=veryquiet) as log_manager:
 
-	if veryquiet:
-		quiet = True
-	timestamp = str(int(time.time()*1000))
-	trash_dir = os.path.join(trash_root, timestamp) if trash_root else None
+		if veryquiet:
+			quiet = True
+		if dry_run and log_path == "-":
+			log_path = None
+		timestamp = str(int(time.time()*1000))
+		trash_dir = os.path.join(trash_root, timestamp) if trash_root else None
 
-	if not isinstance(src_root, str):
-		msg = f"Bad type for arg 'src_root' (expected str): {src_root}"
-		raise TypeError(msg)
-	if not isinstance(dst_root, str):
-		msg = f"Bad type for arg 'dst_root' (expected str): {dst_root}"
-		raise TypeError(msg)
-	if trash_root is not None and not isinstance(trash_root, str):
-		msg = f"Bad type for arg 'trash_root' (expected str): {trash_root}"
-		raise TypeError(msg)
-	if not isinstance(exclude, list):
-		msg = f"Bad type for arg 'exclude' (expected list): {exclude}"
-		raise TypeError(msg)
-	if not isinstance(only, list):
-		msg = f"Bad type for arg 'only' (expected str): {only}"
-		raise TypeError(msg)
-	if not isinstance(ignore_missing, bool):
-		msg = f"Bad type for arg 'ignore_missing' (expected bool): {ignore_missing}"
-		raise TypeError(msg)
-	if rename_threshold is not None and not isinstance(rename_threshold, int):
-		msg = f"Bad type for arg 'rename_threshold' (expected int): {rename_threshold}"
-		raise TypeError(msg)
-	if not isinstance(metadata_only, bool):
-		msg = f"Bad type for arg 'metadata_only' (expected bool): {metadata_only}"
-		raise TypeError(msg)
-	if not isinstance(dry_run, bool):
-		msg = f"Bad type for arg 'dry_run' (expected bool): {dry_run}"
-		raise TypeError(msg)
-	if log_path is not None and not isinstance(log_path, str):
-		msg = f"Bad type for arg 'log_path' (expected str): {log_path}"
-		raise TypeError(msg)
-	if not isinstance(quiet, bool):
-		msg = f"Bad type for arg 'quiet' (expected bool): {quiet}"
-		raise TypeError(msg)
-	if not isinstance(veryquiet, bool):
-		msg = f"Bad type for arg 'veryquiet' (expected bool): {veryquiet}"
-		raise TypeError(msg)
+		if not isinstance(src_root, str):
+			msg = f"Bad type for arg 'src_root' (expected str): {src_root}"
+			raise TypeError(msg)
+		if not isinstance(dst_root, str):
+			msg = f"Bad type for arg 'dst_root' (expected str): {dst_root}"
+			raise TypeError(msg)
+		if trash_root is not None and not isinstance(trash_root, str):
+			msg = f"Bad type for arg 'trash_root' (expected str): {trash_root}"
+			raise TypeError(msg)
+		if not isinstance(exclude, list):
+			msg = f"Bad type for arg 'exclude' (expected list): {exclude}"
+			raise TypeError(msg)
+		if not isinstance(only, list):
+			msg = f"Bad type for arg 'only' (expected str): {only}"
+			raise TypeError(msg)
+		if not isinstance(ignore_missing, bool):
+			msg = f"Bad type for arg 'ignore_missing' (expected bool): {ignore_missing}"
+			raise TypeError(msg)
+		if rename_threshold is not None and not isinstance(rename_threshold, int):
+			msg = f"Bad type for arg 'rename_threshold' (expected int): {rename_threshold}"
+			raise TypeError(msg)
+		if not isinstance(metadata_only, bool):
+			msg = f"Bad type for arg 'metadata_only' (expected bool): {metadata_only}"
+			raise TypeError(msg)
+		if not isinstance(dry_run, bool):
+			msg = f"Bad type for arg 'dry_run' (expected bool): {dry_run}"
+			raise TypeError(msg)
+		if log_path is not None and not isinstance(log_path, str):
+			msg = f"Bad type for arg 'log_path' (expected str): {log_path}"
+			raise TypeError(msg)
+		if not isinstance(quiet, bool):
+			msg = f"Bad type for arg 'quiet' (expected bool): {quiet}"
+			raise TypeError(msg)
+		if not isinstance(veryquiet, bool):
+			msg = f"Bad type for arg 'veryquiet' (expected bool): {veryquiet}"
+			raise TypeError(msg)
 
-	if not os.path.isdir(src_root):
-		msg = f"Chosen src_root is not a directory: {src_root}"
-		raise ValueError(msg)
-	if os.path.exists(dst_root) and not os.path.isdir(dst_root):
-		msg = f"Chosen dst_root is not a directory: {dst_root}"
-		raise ValueError(msg)
-	if trash_root is not None and os.path.exists(trash_root):
-		if os.stat(trash_root).st_dev != os.stat(dst_root).st_dev:
-			msg = f"Chosen trash_root is not on the same filesystem as dst_root: {trash_root}"
+		if not os.path.isdir(src_root):
+			msg = f"Chosen src_root is not a directory: {src_root}"
 			raise ValueError(msg)
-		if os.path.exists(trash_dir) and not os.path.isdir(trash_dir):
-			msg = f"Could not create trash folder {timestamp} in trash_root: {trash_root}"
+		if os.path.exists(dst_root) and not os.path.isdir(dst_root):
+			msg = f"Chosen dst_root is not a directory: {dst_root}"
 			raise ValueError(msg)
-	if rename_threshold is not None and rename_threshold < 0:
-		msg = f"rename_threshold must be non-negative: {rename_threshold}"
-		raise ValueError(msg)
-	if log_path is not None and os.path.exists(log_path):
-		msg = f"Chosen log already exists: {log_path}"
-		raise ValueError(msg)
+		if trash_root is not None and os.path.exists(trash_root):
+			if os.stat(trash_root).st_dev != os.stat(dst_root).st_dev:
+				msg = f"Chosen trash_root is not on the same filesystem as dst_root: {trash_root}"
+				raise ValueError(msg)
+			if os.path.exists(trash_dir) and not os.path.isdir(trash_dir):
+				msg = f"Could not create trash folder {timestamp} in trash_root: {trash_root}"
+				raise ValueError(msg)
+		if rename_threshold is not None and rename_threshold < 0:
+			msg = f"rename_threshold must be non-negative: {rename_threshold}"
+			raise ValueError(msg)
+		if log_path is not None and os.path.exists(log_path):
+			msg = f"Chosen log already exists: {log_path}"
+			raise ValueError(msg)
 
-	with _LogManager(log_path, timestamp=timestamp, suppress_stdout=quiet, suppress_stderr=veryquiet):
+		src_files = _listdir(src_root, only, ignore_missing, exclude)
+		dst_files = _listdir(dst_root, only,           True, exclude)
+
+		if log_path == "-":
+			log_path = os.path.expanduser(os.path.join("~", f"py-backup.{timestamp}.log"))
+			log_manager.log_path = log_path
+		elif log_path:
+			log_manager.log_path = log_path
+
 		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {timestamp=} {exclude=} {only=} {ignore_missing=} {rename_threshold=} {dry_run=} {log_path=} {quiet=} {veryquiet=}")
 
 		width = max(len(src_root), len(dst_root)) + 3
@@ -133,9 +145,6 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 		logger.info("   " + src_root)
 		logger.info("-> " + dst_root)
 		logger.info("-" * width)
-
-		src_files = _listdir(src_root, exclude, only, ignore_missing)
-		dst_files = _listdir(dst_root, exclude, only, ignore_missing)
 
 		if not dry_run:
 			os.makedirs(dst_root, exist_ok=True)
@@ -148,7 +157,7 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 			if not dry_run:
 				if op == "-":
 					try:
-						_move(src, dst)
+						_move(src, dst, root=dst_root)
 						results.delete_success += 1
 						results.byte_diff += byte_diff
 					except OSError as e:
@@ -172,24 +181,43 @@ def backup(src_root, dst_root, *, trash_root=None, exclude=[], only=[], ignore_m
 						logger.error(f"{e.__class__.__name__}: U {dst}")
 				elif op == "R":
 					try:
-						_move(src, dst)
+						_move(src, dst, root=dst_root)
 						results.rename_success += 1
 					except OSError as e:
 						results.rename_error += 1
-						logger.error(f"{e.__class__.__name__}: R {src} -> {dst}", extra={})
+						logger.error(f"{e.__class__.__name__}: R {src} -> {dst}")
+				elif op == "D+":
+					try:
+						os.makedirs(dst, exist_ok=True)
+					except OSError as e:
+						logger.error(f"{e.__class__.__name__}: + {dst}{os.sep}")
+				elif op == "D-":
+					try:
+						os.rmdir(src)
+					except OSError as e:
+						logger.error(f"{e.__class__.__name__}: - {src}{os.sep}")
 				else:
 					assert False
 
 		logger.info("")
+		logger.info("File Stats (Excluding Dirs)")
 		logger.info(f"Rename Success: {results.rename_success}" + (f" / Failed: {results.rename_error}" if results.rename_error else ""))
 		logger.info(f"Create Success: {results.create_success}" + (f" / Failed: {results.create_error}" if results.create_error else ""))
 		logger.info(f"Update Success: {results.update_success}" + (f" / Failed: {results.update_error}" if results.update_error else ""))
 		logger.info(f"Delete Success: {results.delete_success}" + (f" / Failed: {results.delete_error}" if results.delete_error else ""))
-		logger.info(f"Net Change in Bytes: {_human_readable_size(results.byte_diff)}")
+		logger.info(f"Net Change: {_human_readable_size(results.byte_diff)}")
+
+		if results.err_count:
+			logger.info("")
+			logger.info(f"Finished with {results.err_count} errors.")
+			logger.info(f"See the log at {log_path} for details.")
+		else:
+			logger.info("")
+			logger.info("Finished successfully.")
 
 		return results
 
-def _listdir(root, exclude, only, ignore_missing):
+def _listdir(root, only, ignore_missing, exclude):
 	'''
 	Retrieves file relative paths, sizes, and mtimes for files inside a directory. (All "relative paths" are relative to `root`.)
 
@@ -198,20 +226,22 @@ def _listdir(root, exclude, only, ignore_missing):
 
     Args
 		root (str)            : The directory to search.
+		only (list)           : A list of relative paths of files to include in the output. Wildcards are not supported at this time. (Defaults to `[]`.)
+		ignore_missing (bool) : Whether to ignore paths made using `only` that point to non-existent files. If False, this will raise a `ValueError` instead. (Defaults to `False`.)
 		exclude (list)        : A list of names and relative paths to ignore while searching recursively. (Defaults to `[]`.)
-		only (list)           : A list of relative paths of files to include in the output. (Defaults to `[]`.)
-		ignore_missing (bool) : Whether to ignore paths made using `only` that point to non-existent files. If False, this will raise a `FileNotFoundError` instead. (Defaults to `False`.)
 
 	Returns
-		A `dict` with keys being each file's relative path and values being a `namedtuple` of file size ("size") and modtime ("mtime").
+		A SimpleNamespace containing two fields: `relpath_stats` and `empty_dirs`. `relpath_stats` is a `dict` with keys being each file's relative path and values being a `namedtuple` of file size (`size`) and modtime (`mtime`). `empty_dirs` is a set of relative paths to empty directories.
 
 	Raises
-		FileNotFoundError: If `ignore_missing` is `False` and any file indicated by a relative path in `only` does not exist.
+		ValueError: If `ignore_missing` is `False` and any file indicated by a relative path in `only` does not exist.
 	'''
-
 	Metadata = namedtuple("Metadata", ["size", "mtime"])
 
-	relpath_stats = {}
+	file_list = SimpleNamespace()
+	file_list.relpath_stats = {}
+	file_list.empty_dirs = set()
+	#file_list.nonempty_dirs = set()
 
 	if only:
 
@@ -225,10 +255,10 @@ def _listdir(root, exclude, only, ignore_missing):
 			if not os.path.isfile(path):
 				if ignore_missing:
 					continue
-				raise FileNotFoundError(path)
+				raise ValueError(path)
 			stats = os.stat(path)
-			relpath_stats[relpath] = (stats.st_size, stats.st_mtime)
-		return relpath_stats
+			file_list.relpath_stats[relpath] = Metadata(stats.st_size, stats.st_mtime)
+		return file_list
 
 	else:
 
@@ -247,27 +277,33 @@ def _listdir(root, exclude, only, ignore_missing):
 			i = 0
 			while i < len(dirnames):
 				dirname = dirnames[i]
-				if any(fnmatch.fnmatch(dirname, pat) for pat in exclude_dirnames):
+				if any(fnmatch(dirname, pat) for pat in exclude_dirnames):
 					del dirnames[i]
 					i -= 1
 				else:
-					dirpath = os.path.join(dir, dirname)
-					if any(fnmatch.fnmatch(dirpath, pat) for pat in exclude_dirpaths):
+					dir_relpath = os.path.relpath(os.path.join(dir, dirname), root)
+					if any(fnmatch(dir_relpath, pat) for pat in exclude_dirpaths):
 						del dirnames[i]
 						i -= 1
 				i += 1
+			dir_relpath = os.path.relpath(dir, root)
+			if not filenames and not dirnames:
+				file_list.empty_dirs.add(dir_relpath)
 			for filename in filenames:
-				if any(fnmatch.fnmatch(filename, pat) for pat in exclude_filenames):
+				if any(fnmatch(filename, pat) for pat in exclude_filenames):
 					continue
 				filepath = os.path.join(dir, filename)
-				if any(fnmatch.fnmatch(filepath, pat) for pat in exclude_filepaths):
+				if any(fnmatch(filepath, pat) for pat in exclude_filepaths):
 					continue
 				relpath = os.path.relpath(filepath, root)
 				stats = os.stat(filepath)
-				relpath_stats[relpath] = Metadata(stats.st_size, stats.st_mtime)
-		return relpath_stats
+				file_list.relpath_stats[relpath] = Metadata(stats.st_size, stats.st_mtime)
+		return file_list
 
-def _operations(src_relpath_stats, dst_relpath_stats, src_root, dst_root, trash_dir, rename_threshold, metadata_only):
+def _operations(src_files, dst_files, src_root, dst_root, trash_dir, rename_threshold, metadata_only):
+	src_relpath_stats = src_files.relpath_stats
+	dst_relpath_stats = dst_files.relpath_stats
+
 	src_relpaths = set(src_relpath_stats.keys())
 	dst_relpaths = set(dst_relpath_stats.keys())
 
@@ -337,6 +373,18 @@ def _operations(src_relpath_stats, dst_relpath_stats, src_root, dst_root, trash_
 		elif src_time < dst_time:
 			logger.warn(f"Working copy is older than backed-up copy, skipping update: {relpath}")
 
+	# Empty directories
+	src_only_empty_dirs = src_files.empty_dirs.difference(dst_files.empty_dirs)#.difference(dst_files.nonempty_dirs)
+	for relpath in src_only_empty_dirs:
+		dst = os.path.join(dst_root, relpath)
+		if not os.path.isdir(dst):
+			yield ("D+", None, dst, 0, f"+ {relpath}{os.sep}")
+	dst_only_empty_dirs = dst_files.empty_dirs.difference(src_files.empty_dirs)#.difference(src_files.empty_dirs)
+	for relpath in dst_only_empty_dirs:
+		src = os.path.join(dst_root, relpath)
+		if not os.listdir(src):
+			yield ("D-", src, None, 0, f"- {relpath}{os.sep}")
+
 def _copy(src, dst):
 	'''Copy src to dst, keeping metadata, and overwriting any existing file.'''
 	if src.lower() == dst.lower(): #if os.path.samefile(src, dst):
@@ -371,7 +419,7 @@ def _copy(src, dst):
 		if delete_tmp:
 			os.remove(dst_tmp)
 
-def _move(src, dst, *, delete_empty_dirs=True):
+def _move(src, dst, *, delete_empty_dirs=True, root=""):
 	'''Move src to dst (on the same filesystem), failing if dst exists.'''
 	# dst file must either not exist or differ from src by case
 	if dst == src:
@@ -384,32 +432,18 @@ def _move(src, dst, *, delete_empty_dirs=True):
 	os.rename(src, dst)
 	# delete empty directories left after the move
 	if delete_empty_dirs:
-		#try:
-		dir = src
-		while True:
-			dir = os.path.dirname(dir)
-			if not os.listdir(dir):
-				# print(f"- {dir}")
-				os.rmdir(dir)
-			else:
-				break
-		#except OSError:
-		#	pass
-
-def _last_bytes(file_path, n=1024):
-	file_size = os.path.getsize(file_path)
-	bytes_to_read = file_size if n > file_size else n
-	with open(file_path, "rb") as f:
-		f.seek(-bytes_to_read, os.SEEK_END)
-		return f.read()
-
-def _human_readable_size(num_bytes):
-	units = ["bytes", "KB", "MB", "GB", "TB", "PB"]
-	i = 0
-	while num_bytes >= 1024 and i < len(units) - 1:
-		num_bytes /= 1024
-		i += 1
-	return f"{round(num_bytes)} {units[i]}"
+		try:
+			dir = src
+			while True:
+				dir = os.path.dirname(dir)
+				if not os.listdir(dir):
+					relpath = os.path.relpath(dir, root)
+					logger.info(f"- {relpath}{os.sep}")
+					os.rmdir(dir)
+				else:
+					break
+		except OSError:
+			logger.error(f"{e.__class__.__name__}: - {relpath}{os.sep}")
 
 def _reverse_dict(old_dict):
 	'''
@@ -425,8 +459,92 @@ def _reverse_dict(old_dict):
 			reversed[val] = key
 	return reversed
 
+def _last_bytes(file_path, n=1024):
+	file_size = os.path.getsize(file_path)
+	bytes_to_read = file_size if n > file_size else n
+	with open(file_path, "rb") as f:
+		f.seek(-bytes_to_read, os.SEEK_END)
+		return f.read()
+
+def _human_readable_size(num_bytes):
+	sign = "-" if num_bytes < 0 else ""
+	num_bytes = abs(num_bytes)
+	units = ["bytes", "KB", "MB", "GB", "TB", "PB"]
+	i = 0
+	while num_bytes >= 1024 and i < len(units) - 1:
+		num_bytes /= 1024
+		i += 1
+	return f"{sign}{round(num_bytes)} {units[i]}"
+
+class _LogManager:
+	def __init__(self ,*, suppress_stdout, suppress_stderr):
+		self._log_path = None
+		self.final_log_path = None
+		self.log_handler_file = None
+
+		self.suppress_stdout = suppress_stdout
+		self.suppress_stderr = suppress_stderr
+		self.log_handler_console = None
+
+	@property
+	def log_path(self):
+		return self._log_path
+
+	@log_path.setter
+	def log_path(self, val):
+		# file log
+		if val:
+			self.final_log_path = val
+			with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmp_log:
+				self._log_path = tmp_log.name
+			formatter = logging.Formatter("%(levelname)s: %(message)s")
+			self.log_handler_file = logging.FileHandler(self.log_path)
+			self.log_handler_file.setFormatter(formatter)
+			self.log_handler_file.setLevel(logging.DEBUG)
+			logger.addHandler(self.log_handler_file)
+			self.log_handler_console.log_file = val
+		elif self.log_handler_file:
+			logger.removeHandler(self.log_handler_file)
+			self.log_handler_file.close()
+			os.replace(self.log_path, self.final_log_path)
+			self._log_path = None
+			self.final_log_path = None
+			self.log_handler_file = None
+			self.log_handler_console.log_file = None
+
+
+	def __enter__(self):
+		# console log
+		if not self.suppress_stdout or not self.suppress_stderr:
+			formatter = logging.Formatter("%(message)s")
+			self.log_handler_console = _ConsoleHandler(self.suppress_stdout, self.suppress_stderr)
+			self.log_handler_console.setFormatter(formatter)
+			self.log_handler_console.setLevel(logging.INFO)
+			logger.addHandler(self.log_handler_console)
+		return self
+
+	def __exit__(self, exc_type, exc_value, tb):
+		if exc_type:
+			if exc_type is TypeError or exc_type is ValueError:
+				logger.critical(f"Input Error: {exc_value}")
+			elif exc_type is KeyboardInterrupt:
+				logger.warn(f"Cancelled by user.")
+			else:
+				logger.critical(f"{exc_type.__name__}: {exc_value}")
+				logger.debug(traceback.format_exc())
+
+		if self.log_handler_file:
+			logger.removeHandler(self.log_handler_file)
+			self.log_handler_file.close()
+			os.replace(self.log_path, self.final_log_path)
+			self.log_path = self.final_log_path
+
+		if self.log_handler_console:
+			self.log_handler_console.close()
+			logger.removeHandler(self.log_handler_console)
+
 class _ConsoleHandler(logging.Handler):
-	def __init__(self, suppress_stdout, suppress_stderr, max_err_recap=0):
+	def __init__(self, suppress_stdout, suppress_stderr, max_err_recap=10):
 		super().__init__()
 		self.suppress_stdout = suppress_stdout
 		self.suppress_stderr = suppress_stderr
@@ -434,6 +552,7 @@ class _ConsoleHandler(logging.Handler):
 		self.log_records = []
 		self.count_errs = 0
 		self.critical_err = False
+		self.log_file = None
 
 	def emit(self, record):
 		msg = self.format(record)+"\n"
@@ -442,91 +561,33 @@ class _ConsoleHandler(logging.Handler):
 				sys.stdout.write(msg)
 		else:
 			self.count_errs += 1
-			if self.count_errs <= self.max_err_recap:
+			if self.count_errs < self.max_err_recap:
 				self.log_records.append(msg)
 			if not self.suppress_stderr:
 				sys.stderr.write(msg)
 			if record.levelname == "CRITICAL":
 				self.critical_err = True
 
-	def close(self, log_path):
-		if not self.suppress_stderr:
-			if self.count_errs > 0:
-				if self.critical_err:
-					sys.stderr.write("Encountered a critical internal issue. This is not due to user input.\n")
-				else:
-					sys.stderr.write(f"Encountered {self.count_errs} filesystem errors.\n")
-				if log_path:
-					sys.stderr.write(f"See the log at {log_path} for details.\n")
+	def close(self):
+		if not self.suppress_stdout:
 			if 0 < self.count_errs <= self.max_err_recap and not self.critical_err:
-				sys.stderr.write("Errors are reprinted below for convenience:\n")
+				sys.stdout.write("Errors are reprinted below for convenience:\n")
 				for err in self.log_records:
-					sys.stderr.write(err)
-
-class _LogManager:
-	def __init__(self, log_path ,*, timestamp, suppress_stdout, suppress_stderr):
-		self.log_path = log_path
-		self.final_log_path = log_path
-		self.log_handler_file = None
-
-		self.suppress_stdout = suppress_stdout
-		self.suppress_stderr = suppress_stderr
-		self.log_handler_console = None
-
-	def __enter__(self):
-		# file log
-		if self.log_path == "-":
-			with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmp_log:
-				self.log_path = tmp_log.name
-			self.final_log_path = os.path.expanduser(os.path.join("~", f"py-backup.{timestamp}.log"))
-		if self.log_path:
-			formatter = logging.Formatter("%(levelname)s: %(message)s")
-			self.log_handler_file = logging.FileHandler(self.log_path)
-			self.log_handler_file.setFormatter(formatter)
-			self.log_handler_file.setLevel(logging.DEBUG)
-			logger.addHandler(self.log_handler_file)
-
-		# console log
-		if not self.suppress_stdout or not self.suppress_stderr:
-			formatter = logging.Formatter("%(message)s")
-			self.log_handler_console = _ConsoleHandler(self.suppress_stdout, self.suppress_stderr)
-			self.log_handler_console.setFormatter(formatter)
-			self.log_handler_console.setLevel(logging.INFO)
-			logger.addHandler(self.log_handler_console)
-
-		return self
-
-	def __exit__(self, exc_type, exc_value, tb):
-		if exc_type:
-			logger.critical(f"{exc_type.__name__}: {exc_value}")
-			logger.debug(traceback.format_exc())
-
-		if self.log_handler_file:
-			logger.removeHandler(self.log_handler_file)
-			self.log_handler_file.close()
-			if self.log_path != self.final_log_path:
-				os.replace(self.log_path, self.final_log_path)
-				self.log_path = self.final_log_path
-
-		if self.log_handler_console:
-			self.log_handler_console.close(self.log_path)
-			logger.removeHandler(self.log_handler_console)
+					sys.stdout.write(err)
 
 class _ArgParser:
 	parser = argparse.ArgumentParser(
 		description="Copy new and updated files from one directory to another, update renamed files' names to match where possible, and optionally delete non-matching files.",
 		epilog="(c) 2025 Joe Walter")
+
 	parser.add_argument("src_root", help="The root directory to copy files from.")
 	parser.add_argument("dst_root", help="The root directory to copy files to.")
 
-	group = parser.add_mutually_exclusive_group(required=False)
-	group.add_argument("--only", metavar="name_or_relpath", nargs="+", default=[], help="A whitelist of file relative paths that will exclude all other files and directories from the backup. Mutually exclusive with --exclude.")
-	group.add_argument("-x", "--exclude", metavar="name_or_relpath", nargs="+", default=[], help=f"A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to both src_root and dst_root. Entries ending with {os.sep} will be treated as a directory only. Mutually exclusive with --only.")
-
+	parser.add_argument("--only", metavar="name_or_relpath", nargs="*", default=[], help="A whitelist of relative paths that will exclude all other files and directories from the backup. Wildcards are not supported at this time.")
+	parser.add_argument("-x", "--exclude", metavar="name_or_relpath", nargs="*", default=[], help=f"A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to entries in src_root and dst_root, except for those indicated by only. Entries ending with {os.sep} will be treated as a directory only.")
 	parser.add_argument("-t", "--trash-root", metavar="path", default=None, help="The root directory to place files that are 'deleted' from dst_root. Must be on the same filesystem as dst_root. Files will not be 'deleted' if this option is omitted.")
 	parser.add_argument("--ignore-missing", action="store_true", default=False, help="Indicate the relative paths indicated by --only may point to non-existent files.")
 	parser.add_argument("-r", "--rename-threshold", metavar="size", type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root that were renamed in src_root. Renamed files below this threshold will be simply deleted in dst_root and their replacements created.")
-
 	parser.add_argument("-m", "--metadata_only", action="store_true", default=False, help="Use only metadata in determining which files in dst_root are the result of a rename. Otherwise, backup will also compare the last 1kb of files.")
 	parser.add_argument("--dry-run", action="store_true", default=False, help="Forgo performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console.")
 
@@ -580,19 +641,16 @@ def main():
 	'''
 	try:
 		results = backup2(sys.argv[1:])
-		if results.errors:
-			print("Finished with errors.")
+		if results.err_count:
 			sys.exit(3)
 		else:
-			print("Finished successfully.")
 			sys.exit(0)
 	except KeyboardInterrupt:
-		print("Cancelled by user.")
 		sys.exit(130)
 	except (ValueError, TypeError) as e:
-		print(f"Input Error: {e}")
 		sys.exit(2)
 	except Exception:
+		print()
 		traceback.print_exc()
 		sys.exit(1)
 
