@@ -3,6 +3,7 @@
 # TODO load folder-by-folder from _listdir if rename_threshold is None (no renames means dir contents don't need to be loaded completely into memory)
 # TODO could also load folder-by-folder if potential renames are not checked between folders
 # TODO Backup class to reduce arg passing (_listdir is an issue b/c it takes two sets of args depending on the root to search)
+# TODO _Pattern class
 # TODO testing
 # TODO write a method to do backup()s in stages for large directories
 
@@ -227,7 +228,7 @@ def _fnmatch(path, pattern):
 	return fnmatch(path, pattern)
 
 @lru_cache
-def _dpmatch(path, pattern):
+def _fnmatch_or_child(path, pattern):
 	if path.count(os.sep) < pattern.count(os.sep):
 		return False
 	path = path.split(os.sep)
@@ -383,7 +384,7 @@ def _listdir(root, include, ignore_missing, exclude):
 		depth       = dir_relpath.count(os.sep)
 
 		if depth <= depth_in_included_relpath_dir:
-			if any(_dpmatch(dir_relpath, pat) for pat in include_dirpaths):
+			if any(_fnmatch_or_child(dir_relpath, pat) for pat in include_dirpaths):
 				in_included_relpath_dir = True
 				depth_in_included_relpath_dir = depth
 			else:
