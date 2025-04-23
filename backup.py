@@ -22,6 +22,7 @@ from collections import Counter
 from collections import namedtuple
 from types import SimpleNamespace
 from functools import lru_cache
+from direntry_walk import direntry_walk
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -372,12 +373,12 @@ def _listdir(root, include, ignore_missing, exclude):
 	in_included_relpath_dir = False
 	depth_in_included_relpath_dir = 9999
 
-	for dir, subdirnames, filenames in os.walk(root):
+	for dir, subdirnames, file_entries in direntry_walk(root):
 		print("in " + dir)
 
 		# sorting may be needed if _listdir is changed to yield folder-by-folder
 		#subdirnames.sort()
-		#filenames.sort()
+		#file_entries.sort()
 
 		dirname     = os.path.basename(dir)
 		dir_relpath = os.path.relpath(dir, root)
@@ -405,7 +406,7 @@ def _listdir(root, include, ignore_missing, exclude):
 							(include_dirnames and any(_fnmatch(dirname, pat) for pat in include_dirnames))
 
 		# catalog empty directory
-		if not filenames and not subdirnames:
+		if not file_entries and not subdirnames:
 			file_list.empty_dirs.add(dir_relpath)
 			continue
 		#else:
@@ -438,7 +439,8 @@ def _listdir(root, include, ignore_missing, exclude):
 				continue
 			i += 1
 
-		for filename in filenames:
+		for entry in file_entries:
+			filename = entry.name
 			# prune by excluded file names
 			if any(_fnmatch(filename, pat) for pat in exclude_filenames):
 				continue
@@ -465,8 +467,7 @@ def _listdir(root, include, ignore_missing, exclude):
 				continue
 
 			# file meets all criteria, add it to the return result
-			stats = os.stat(file_path)
-			file_list.relpath_stats[file_relpath] = Metadata(stats.st_size, stats.st_mtime)
+			file_list.relpath_stats[file_relpath] = Metadata(entry.stat().st_size, entry.stat().st_mtime)
 
 	# raise error if any explicitly included files were not found during the search, unless ignore_missing is True
 	if not ignore_missing:
