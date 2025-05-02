@@ -1,11 +1,8 @@
 # Copyright (c) 2025 Joe Walter
 
-# TODO load folder-by-folder from _listdir if rename_threshold is None (no renames means dir contents don't need to be loaded completely into memory)
-# TODO could also load folder-by-folder if potential renames are not checked between folders
-# TODO Backup class to reduce arg passing (_listdir is an issue b/c it takes two sets of args depending on the root to search)
-# TODO _Pattern class
-# TODO testing
-# TODO write a method to do backup()s in stages for large directories
+# Terminology
+# "entry" = file or directory
+# "basename" = filename without the extension
 
 import sys
 import argparse
@@ -287,9 +284,9 @@ def _listdir(root, include, ignore_missing, exclude):
 
 	# categorize include patterns
 	include_dirnames  = set()
-	include_dirpaths  = set()
+	include_dirpaths  = set() # TODO include_dir_relpaths
 	include_filenames = set()
-	include_filepaths = set()
+	include_filepaths = set() # TODO include_file_relpaths
 	for pat in include:
 		pattern = _pattern(pat)
 		if pattern.trailing_slash:
@@ -313,9 +310,9 @@ def _listdir(root, include, ignore_missing, exclude):
 
 	# categorize exclude patterns
 	exclude_dirnames  = set()
-	exclude_dirpaths  = set()
+	exclude_dirpaths  = set() # TODO exclude_dir_relpaths
 	exclude_filenames = set()
-	exclude_filepaths = set()
+	exclude_filepaths = set() # TODO exclude_file_relpaths
 	for pat in exclude:
 		pattern = _pattern(pat)
 		if pattern.trailing_slash:
