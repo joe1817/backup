@@ -238,9 +238,9 @@ def _fnmatch_or_child(path, pattern):
 
 def _pattern(pat):
 	if "**" in pat:
-		raise ValueError(f"Recursive globs ('**') are not supported in pat arguments to include/exclude: {pat}")
+		raise ValueError(f"Recursive globs ('**') are not supported in pattern arguments to include/exclude: {pat}")
 	if pat == ".." or pat.startswith(f"..{os.sep}") or f"{os.sep}..{os.sep}" in pat or pat.endswith(f"{os.sep}.."):
-		raise ValueError(f"Parent directories ('..') are not supported in pat arguments to include/exclude: {pat}")
+		raise ValueError(f"Parent directories ('..') are not supported in pattern arguments to include/exclude: {pat}")
 	if os.path.isabs(pat):
 		raise ValueError(f"Absolute paths are not supported as arguments to include/exclude: {path}")
 	pattern = SimpleNamespace()
@@ -251,7 +251,7 @@ def _pattern(pat):
 	pattern.multipart      = os.sep in pattern.pat
 	return pattern
 
-def _listdir(root, include, ignore_missing, exclude):
+def _listdir(root, include=[], exclude=[], ignore_missing=False, all_dir_patterns_are_paths=True):
 	'''
 	Retrieves file relative paths, sizes, and mtimes for files inside a directory. (All "relative paths" are relative to `root`.)
 
@@ -261,8 +261,9 @@ def _listdir(root, include, ignore_missing, exclude):
     Args
 		root (str)            : The directory to search.
 		include (list)        : A list of relative paths of files to include in the output. Wildcards are not supported at this time. (Defaults to `[]`.)
-		ignore_missing (bool) : Whether to ignore paths made using `include` that point to non-existent files. If False, this will raise a `ValueError` instead. (Defaults to `False`.)
 		exclude (list)        : A list of names and relative paths to ignore while searching recursively. (Defaults to `[]`.)
+		ignore_missing (bool) : Whether to ignore paths made using `include` that point to non-existent files. If False, this will raise a `ValueError` instead. (Defaults to `False`.)
+		all_dir_patterns_are_paths (bool) : Whether to treat all directory patterns as relative paths. (Defaults to `True`.)
 
 	Returns
 		A SimpleNamespace containing two fields: `relpath_stats` and `empty_dirs`. `relpath_stats` is a `dict` with keys being each file's relative path and values being a `namedtuple` of file size (`size`) and modtime (`mtime`). `empty_dirs` is a set of relative paths to empty directories.
@@ -276,6 +277,7 @@ def _listdir(root, include, ignore_missing, exclude):
 	file_list.relpath_stats = {}
 	file_list.empty_dirs = set()
 	#file_list.nonempty_dirs = set()
+	file_list._scan_count = 0 # for debugging
 
 	if isinstance(include, str):
 		include = [include]
@@ -334,9 +336,12 @@ def _listdir(root, include, ignore_missing, exclude):
 				exclude_dirnames.add(pattern.pat)
 				exclude_filenames.add(pattern.pat)
 
-	# if treating all dirnames as dirpaths for including purposes
-	include_dirpaths |= include_dirnames
-	include_dirnames = set()
+	# if treating all dirnames as dirpaths
+	if all_dir_patterns_are_paths:
+		include_dirpaths |= include_dirnames
+		include_dirnames = set()
+		exclude_dirpaths |= exclude_dirnames
+		exclude_dirnames = set()
 
 	# gather dirs for a narrow search
 	# if filename or dirname patterns exists then do a full scan
@@ -371,7 +376,8 @@ def _listdir(root, include, ignore_missing, exclude):
 	depth_in_included_relpath_dir = 9999
 
 	for dir, subdirnames, file_entries in direntry_walk(root):
-		print("in " + dir)
+		logger.debug("_listdir: in " + dir)
+		file_list._scan_count += 1
 
 		# sorting may be needed if _listdir is changed to yield folder-by-folder
 		#subdirnames.sort()
@@ -430,7 +436,7 @@ def _listdir(root, include, ignore_missing, exclude):
 				continue
 
 			# prune search tree during narrow searches (i.e., searches with only relpath patterns)
-			# paths need to be a child to a an included dir or a parent to an included entry (file or dir)
+			# paths need to be a child to an included dir or a parent to an included entry (file or dir)
 			if not in_included_dir and ancestors_of_included and not any(_fnmatch(subdir_relpath, pat) for pat in ancestors_of_included):
 				del subdirnames[i]
 				continue
