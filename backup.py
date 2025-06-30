@@ -40,7 +40,7 @@ class Results:
 	def err_count(self):
 		return self.create_error + self.rename_error + self.update_error + self.delete_error
 
-def backup(src_root, dst_root, *, trash_root=None, include=[], ignore_missing=False, exclude=[], rename_threshold=10000, metadata_only=False, dry_run=False, log_path="-", quiet=False, veryquiet=False):
+def backup(src_root, dst_root, *, trash_root=None, include=[], exclude=[], ignore_missing=False, rename_threshold=10000, metadata_only=False, dry_run=False, log_path="-", quiet=False, veryquiet=False):
 	'''
 	Copies new and updated files from `src_root` to `dst_root`, and optionally "deletes" files from `dst_root` if they are not present in `src_root` (they will be moved into `trash_root`, preserving directory structure). Furthermore, files that exist in `dst_root` but renamed in `src_root` may be renamed in `dst_root` to match. Candidates for rename are discovered by searching for files with an identical metadata signature, consisting of file size and modification time. These candidates must be above a minimum size threshold (`rename_threshold`) and have an unambiguously unique metadata signature within their respective root directories. The user is asked to confirm these renames before they are committed.
 
@@ -82,8 +82,6 @@ def backup(src_root, dst_root, *, trash_root=None, include=[], ignore_missing=Fa
 		if trash_root is not None and not isinstance(trash_root, str):
 			msg = f"Bad type for arg 'trash_root' (expected str): {trash_root}"
 			raise TypeError(msg)
-		if trash_root is None:
-			logger.warn("Trash flag (-t/--trash) present but no trash directory provided. Ignoring.")
 		if not isinstance(include, list):
 			msg = f"Bad type for arg 'include' (expected str): {include}"
 			raise TypeError(msg)
@@ -132,8 +130,8 @@ def backup(src_root, dst_root, *, trash_root=None, include=[], ignore_missing=Fa
 			msg = f"Chosen log already exists: {log_path}"
 			raise ValueError(msg)
 
-		src_files = _listdir(src_root, include, ignore_missing, exclude)
-		dst_files = _listdir(dst_root, include,           True, exclude)
+		src_files = _listdir(src_root, include=include, exclude=exclude, ignore_missing=ignore_missing)
+		dst_files = _listdir(dst_root, include=include, exclude=exclude, ignore_missing=True)
 
 		if log_path == "-":
 			log_path = os.path.expanduser(os.path.join("~", f"py-backup.{timestamp}.log"))
@@ -251,7 +249,7 @@ def _pattern(pat):
 	pattern.multipart      = os.sep in pattern.pat
 	return pattern
 
-def _listdir(root, include=[], exclude=[], ignore_missing=False, all_dir_patterns_are_paths=True):
+def _listdir(root, *, include=[], exclude=[], ignore_missing=False, all_dir_patterns_are_paths=True):
 	'''
 	Retrieves file relative paths, sizes, and mtimes for files inside a directory. (All "relative paths" are relative to `root`.)
 
@@ -675,10 +673,10 @@ class _LogManager:
 		# file log
 		if val:
 			self.final_log_path = val
-			with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmp_log:
+			with tempfile.NamedTemporaryFile(mode="w+", encoding='utf-8', delete=False) as tmp_log:
 				self._log_path = tmp_log.name
 			formatter = logging.Formatter("%(levelname)s: %(message)s")
-			self.log_handler_file = logging.FileHandler(self.log_path)
+			self.log_handler_file = logging.FileHandler(self.log_path, encoding='utf-8')
 			self.log_handler_file.setFormatter(formatter)
 			self.log_handler_file.setLevel(logging.DEBUG)
 			logger.addHandler(self.log_handler_file)
