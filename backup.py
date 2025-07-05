@@ -1,31 +1,38 @@
 # Copyright (c) 2025 Joe Walter
 
-# Terminology
-# "entry" = file or directory
+# Terms used:
+# "entry"    = file or directory
 # "basename" = filename without the extension
 
 import sys
 import argparse
 import os
 import io
+import glob
+import re
 import stat
 import shutil
 import logging
 import tempfile
 import time
 import traceback
+from pathlib import Path
 from fnmatch import fnmatch
 from collections import Counter
 from collections import namedtuple
 from types import SimpleNamespace
 from functools import lru_cache
 from direntry_walk import direntry_walk
+from typing import Any
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 class Results:
-	def __init__(self):
+	def __init__(self) -> None:
+		self.trash_root : Path | None = None
+		self.log_file   : Path | None = None
+
 		self.create_success = 0
 		self.rename_success = 0
 		self.update_success = 0
@@ -37,59 +44,72 @@ class Results:
 		self.byte_diff = 0
 
 	@property
-	def err_count(self):
+	def err_count(self) -> int:
 		return self.create_error + self.rename_error + self.update_error + self.delete_error
 
-def backup(src_root, dst_root, *, trash_root=None, include=[], exclude=[], ignore_missing=False, rename_threshold=10000, metadata_only=False, dry_run=False, log_path="-", quiet=False, veryquiet=False):
+def backup(
+		src              : str | os.PathLike[str],
+		dst              : str | os.PathLike[str],
+		*,
+		trash            : str | os.PathLike[str] | None = None,
+		filter           : str  = "+ **/*/ **/*",
+		ignore_hidden    : bool = False,
+		follow_symlinks  : bool = False,
+		rename_threshold : int | None  = 10000,
+		metadata_only    : bool = False,
+		dry_run          : bool = False,
+		log              : str | os.PathLike[str] | None = None,
+		quiet            : bool = False,
+		veryquiet        : bool = False
+	) -> Results:
 	'''
-	Copies new and updated files from `src_root` to `dst_root`, and optionally "deletes" files from `dst_root` if they are not present in `src_root` (they will be moved into `trash_root`, preserving directory structure). Furthermore, files that exist in `dst_root` but renamed in `src_root` may be renamed in `dst_root` to match. Candidates for rename are discovered by searching for files with an identical metadata signature, consisting of file size and modification time. These candidates must be above a minimum size threshold (`rename_threshold`) and have an unambiguously unique metadata signature within their respective root directories. The user is asked to confirm these renames before they are committed.
+	Copies new and updated files from `src` to `dst`, and optionally "deletes" files from `dst` if they are not present in `src` (they will be moved into `trash`, preserving directory structure). Furthermore, files that exist in `dst` but as a different name in `src` may be renamed in `dst` to match. Candidates for rename are discovered by searching for files with an identical metadata signature, consisting of file size and modification time. These candidates must be above a minimum size threshold (`rename_threshold`) and have an unambiguously unique metadata signature within their respective root directories. The user is asked to confirm these renames before they are committed.
 
 	Args
-		src_root (str)         : The root directory to copy files from.
-		dst_root (str)         : The root directory to copy files to.
-		trash_root (str)       : The root directory to place files that are "deleted" from `dst_root`. Must be on the same filesystem as `dst_root`. Files will not be "deleted" if this is `None`. (Defaults to `None`.)
-		include (list(str))    : A whitelist of relative paths that will exclude all other files and directories from the backup. Non-recursive globs (e.g., *.txt) are supported. (Defaults to `[]`.)
-		ignore_missing (bool)  : Whether the relative paths indicated by `include` may point to non-existent files in `src_root`. (Defaults to `False`.)
-		exclude (list(str))    : A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to entries in `src_root` and `dst_root`, except for those indicated by `include`. Entries ending with `os.sep` will be treated as a directory only. (Defaults to `[]`.)
-		rename_threshold (int) : The minimum size in bytes needed to consider renaming files in `dst_root` that were renamed in `src_root`. Renamed files below this threshold will be simply deleted in `dst_root` and their replacements created. A value of `None` will mean no files in `dst_root` will be eligible for renaming. (Defaults to `10000`.)
-		metadata_only (bool)   : Whether to use only metadata in determining which files in dst_root are the result of a rename. If set to False, `backup` will also compare the last 1kb of files. (Defaults to `False`.)
-		dry_run (bool)         : Whether to hold off performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console. (Defaults to `False`.)
-		log_path (str)         : File to write log messages to. A falsy value means no log will be created. A value of '-' means a tempfile will be used for the log, and it will be copied to the user's home directory after the backup is done. (Defaults to '-'.)
-		quiet (bool)           : Whether to forgo printing to stdout.
-		veryquiet (bool)       : Whether to forgo printing to stdout and stderr.
+		src (str or PathLike)      : The root directory to copy files from.
+		dst (str or PathLike)      : The root directory to copy files to.
+		trash (str or PathLike)    : The root directory to move 'extra' files (those that are in `dst` but not `src`). Must be on the same filesystem as `dst`. If set to "auto", then a directory will automatically be made next to `dst`. Extra files will not be moved if this argument is `None`. (Defaults to `None`.)
+
+		filter (str)               : The filter to include/exclude files and directories. Similar to rsync, the format of the filter string is: (+ or -), followed by a list of one of more relative path patterns, and otionally repeat from the start. Including (+) or excluding (-) of entries is determined by the preceding symbol of the first matching pattern. Included files will be copied, while included directories will be searched. Each Pattern ending with "/" will apply to directories only. Otherise the pattern will apply only to files. (Defaults to "+ **/*/ **/*", which searches all directories and copies all files.)
+		ignore_hidden (bool)       : Whether to skip hidden files by default. If `True`, then wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., "**/.*") will still match these entries. (Defaults to `False`.)
+		follow_symlinks (bool)     : Whether to follow symbolic links under `src` and `dst`. Note that `src` and `dst` themselves will be followed if either is a symlink. (Defaults to `False`.)
+		rename_threshold (int)     : The minimum size in bytes needed to consider renaming files in `dst` that were renamed in `src`. Renamed files below this threshold will be simply deleted in `dst` and their replacements created. A value of `None` will mean no files in `dst` will be eligible for renaming. (Defaults to `10000`.)
+		metadata_only (bool)       : Whether to use only metadata in determining which files in dst are the result of a rename. If set to False, `backup` will also compare the last 1kb of files. (Defaults to `False`.)
+		dry_run (bool)             : Whether to hold off performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console. (Defaults to `False`.)
+
+		log (str or PathLike) : File to write log messages to. A value of "auto" means a tempfile will be used for the log, and it will be copied to the user's home directory after the backup is done. A value of `None` will skip logging. (Defaults to `None`.)
+		quiet (bool)               : Whether to forgo printing to stdout.
+		veryquiet (bool)           : Whether to forgo printing to stdout and stderr.
 
 	Console Output
-
+		TODO
 
 	Returns
 		A `Results` object containing various statistics.
 	'''
+	results = Results()
+
+	if veryquiet:
+		quiet = True
+	if dry_run and log == "auto":
+		log = None
+
 	with _LogManager(suppress_stdout=quiet, suppress_stderr=veryquiet) as log_manager:
 
-		if veryquiet:
-			quiet = True
-		if dry_run and log_path == "-":
-			log_path = None
-		timestamp = str(int(time.time()*1000))
-		trash_dir = os.path.join(trash_root, timestamp) if trash_root else None
-
-		if not isinstance(src_root, str):
-			msg = f"Bad type for arg 'src_root' (expected str): {src_root}"
+		if not isinstance(src, (str, os.PathLike)):
+			msg = f"Bad type for arg 'src' (expected str or PathLike): {src}"
 			raise TypeError(msg)
-		if not isinstance(dst_root, str):
-			msg = f"Bad type for arg 'dst_root' (expected str): {dst_root}"
+		if not isinstance(dst, (str, os.PathLike)):
+			msg = f"Bad type for arg 'dst' (expected str or PathLike): {dst}"
 			raise TypeError(msg)
-		if trash_root is not None and not isinstance(trash_root, str):
-			msg = f"Bad type for arg 'trash_root' (expected str): {trash_root}"
+		if trash is not None and not isinstance(trash, (str, os.PathLike)):
+			msg = f"Bad type for arg 'trash' (expected str or PathLike): {trash}"
 			raise TypeError(msg)
-		if not isinstance(include, list):
-			msg = f"Bad type for arg 'include' (expected str): {include}"
+		if not isinstance(filter, str):
+			msg = f"Bad type for arg 'filter' (expected str): {filter}"
 			raise TypeError(msg)
-		if not isinstance(ignore_missing, bool):
-			msg = f"Bad type for arg 'ignore_missing' (expected bool): {ignore_missing}"
-			raise TypeError(msg)
-		if not isinstance(exclude, list):
-			msg = f"Bad type for arg 'exclude' (expected list): {exclude}"
+		if not isinstance(ignore_hidden, bool):
+			msg = f"Bad type for arg 'ignore_hidden' (expected bool): {ignore_hidden}"
 			raise TypeError(msg)
 		if rename_threshold is not None and not isinstance(rename_threshold, int):
 			msg = f"Bad type for arg 'rename_threshold' (expected int): {rename_threshold}"
@@ -100,8 +120,8 @@ def backup(src_root, dst_root, *, trash_root=None, include=[], exclude=[], ignor
 		if not isinstance(dry_run, bool):
 			msg = f"Bad type for arg 'dry_run' (expected bool): {dry_run}"
 			raise TypeError(msg)
-		if log_path is not None and not isinstance(log_path, str):
-			msg = f"Bad type for arg 'log_path' (expected str): {log_path}"
+		if log is not None and not isinstance(log, (str, os.PathLike)):
+			msg = f"Bad type for arg 'log' (expected str or PathLike): {log}"
 			raise TypeError(msg)
 		if not isinstance(quiet, bool):
 			msg = f"Bad type for arg 'quiet' (expected bool): {quiet}"
@@ -110,377 +130,275 @@ def backup(src_root, dst_root, *, trash_root=None, include=[], exclude=[], ignor
 			msg = f"Bad type for arg 'veryquiet' (expected bool): {veryquiet}"
 			raise TypeError(msg)
 
-		if not os.path.isdir(src_root):
+		src_root = Path(src)
+		dst_root = Path(dst)
+
+		timestamp = str(int(time.time()*1000))
+		if trash is None:
+			trash_root = None
+		elif trash == "auto":
+			trash_root = Path(dst_root).parent / f"Trash.{timestamp}"
+		else:
+			trash_root = Path(trash).parent / timestamp
+		results.trash_root = trash_root
+
+		if log is None:
+			log_file = None
+		elif log == "auto":
+			log_file = Path.home() / f"py-backup.{timestamp}.log"
+		else:
+			log_file = Path(log)
+		results.log_file = log_file
+
+		if src_root.exists() and not src_root.is_dir(): # should also allow a symlink pointing to a dir
 			msg = f"Chosen src_root is not a directory: {src_root}"
 			raise ValueError(msg)
-		if os.path.exists(dst_root) and not os.path.isdir(dst_root):
+		if dst_root.exists() and not dst_root.is_dir():
 			msg = f"Chosen dst_root is not a directory: {dst_root}"
 			raise ValueError(msg)
-		if trash_root is not None and os.path.exists(trash_root):
+		if trash_root is not None and trash_root.exists() and not trash_root.is_dir():
+			msg = f"Chosen trash_root is not a directory: {trash_root}"
+			raise ValueError(msg)
+		if log_file is not None and os.path.exists(log_file):
+			msg = f"Chosen log already exists: {log_file}"
+			raise ValueError(msg)
+
+		if not dry_run:
+			os.makedirs(dst_root, exist_ok=True)
+			if trash_root is not None:
+				os.makedirs(trash_root, exist_ok=True)
+
+		if trash_root is not None and trash_root.exists():
 			if os.stat(trash_root).st_dev != os.stat(dst_root).st_dev:
 				msg = f"Chosen trash_root is not on the same filesystem as dst_root: {trash_root}"
-				raise ValueError(msg)
-			if os.path.exists(trash_dir) and not os.path.isdir(trash_dir):
-				msg = f"Could not create trash folder {timestamp} in trash_root: {trash_root}"
 				raise ValueError(msg)
 		if rename_threshold is not None and rename_threshold < 0:
 			msg = f"rename_threshold must be non-negative: {rename_threshold}"
 			raise ValueError(msg)
-		if log_path is not None and os.path.exists(log_path):
-			msg = f"Chosen log already exists: {log_path}"
-			raise ValueError(msg)
 
-		src_files = _listdir(src_root, include=include, exclude=exclude, ignore_missing=ignore_missing)
-		dst_files = _listdir(dst_root, include=include, exclude=exclude, ignore_missing=True)
+		src_files = _FileList(src_root, filter=filter, ignore_hidden=ignore_hidden, follow_symlinks=follow_symlinks)
+		dst_files = _FileList(dst_root, filter=filter, ignore_hidden=ignore_hidden, follow_symlinks=follow_symlinks)
 
-		if log_path == "-":
-			log_path = os.path.expanduser(os.path.join("~", f"py-backup.{timestamp}.log"))
-			log_manager.log_path = log_path
-		elif log_path:
-			log_manager.log_path = log_path
+		if log_file is not None:
+			log_manager.log_file = log_file
 
-		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {timestamp=} {exclude=} {include=} {ignore_missing=} {rename_threshold=} {dry_run=} {log_path=} {quiet=} {veryquiet=}")
+		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {filter=} {ignore_hidden=} {rename_threshold=} {dry_run=} {log_file=} {quiet=} {veryquiet=}")
 
-		width = max(len(src_root), len(dst_root)) + 3
+		width = max(len(str(src_root)), len(str(dst_root))) + 3
 		#logger.info("=" * width)
-		logger.info("   " + src_root)
-		logger.info("-> " + dst_root)
+		logger.info("   " + str(src_root))
+		logger.info("-> " + str(dst_root))
 		logger.info("-" * width)
 
-		if not dry_run:
-			os.makedirs(dst_root, exist_ok=True)
-
-		results = Results()
-
-		for op, src, dst, byte_diff, summary in _operations(src_files, dst_files, src_root, dst_root, trash_dir, rename_threshold, metadata_only):
+		for op, src_file, dst_file, byte_diff, summary in _operations(
+			src_files,
+			dst_files,
+			trash_root       = trash_root,
+			rename_threshold = rename_threshold,
+			metadata_only    = metadata_only
+		):
 			logger.info(summary)
 
 			if not dry_run:
 				if op == "-":
 					try:
-						_move(src, dst, root=dst_root)
+						_move(src_file, dst_file, delete_empty_dirs_under=dst_root)
 						results.delete_success += 1
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.delete_error += 1
-						logger.error(f"{e.__class__.__name__}: - {dst}")
+						logger.error(f"{e.__class__.__name__}: - {dst_file}")
 				elif op == "+":
 					try:
-						_copy(src, dst)
+						_copy(src_file, dst_file)
 						results.create_success += 1
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.create_error += 1
-						logger.error(f"{e.__class__.__name__}: + {dst}")
+						logger.error(f"{e.__class__.__name__}: + {dst_file}")
 				elif op == "U":
 					try:
-						_copy(src, dst)
+						_copy(src_file, dst_file)
 						results.update_success += 1
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.update_error += 1
-						logger.error(f"{e.__class__.__name__}: U {dst}")
+						logger.error(f"{e.__class__.__name__}: U {dst_file}")
 				elif op == "R":
 					try:
-						_move(src, dst, root=dst_root)
+						_move(src_file, dst_file, delete_empty_dirs_under=dst_root)
 						results.rename_success += 1
 					except OSError as e:
 						results.rename_error += 1
-						logger.error(f"{e.__class__.__name__}: R {src} -> {dst}")
+						logger.error(f"{e.__class__.__name__}: R {src_file} -> {dst_file}")
 				elif op == "D+":
 					try:
-						os.makedirs(dst, exist_ok=True)
+						os.makedirs(dst_file, exist_ok=True)
 					except OSError as e:
-						logger.error(f"{e.__class__.__name__}: + {dst}{os.sep}")
+						logger.error(f"{e.__class__.__name__}: + {dst_file}{os.sep}")
 				elif op == "D-":
 					try:
-						os.rmdir(src)
+						_delete_empty_dirs(src_file, root=dst_root)
 					except OSError as e:
-						logger.error(f"{e.__class__.__name__}: - {src}{os.sep}")
+						logger.error(f"{e.__class__.__name__}: - {src_file}{os.sep}")
 				else:
 					assert False
 
-		logger.info("")
-		logger.info("File Stats (Excluding Dirs)")
-		logger.info(f"Rename Success: {results.rename_success}" + (f" / Failed: {results.rename_error}" if results.rename_error else ""))
-		logger.info(f"Create Success: {results.create_success}" + (f" / Failed: {results.create_error}" if results.create_error else ""))
-		logger.info(f"Update Success: {results.update_success}" + (f" / Failed: {results.update_error}" if results.update_error else ""))
-		logger.info(f"Delete Success: {results.delete_success}" + (f" / Failed: {results.delete_error}" if results.delete_error else ""))
-		logger.info(f"Net Change: {_human_readable_size(results.byte_diff)}")
+
+		if dry_run:
+			logger.info("")
+			logger.info("*** DRY RUN ***")
+		else:
+			logger.info("")
+			logger.info("File Stats (Excluding Dirs)")
+			logger.info(f"Rename Success: {results.rename_success}" + (f" / Failed: {results.rename_error}" if results.rename_error else ""))
+			logger.info(f"Create Success: {results.create_success}" + (f" / Failed: {results.create_error}" if results.create_error else ""))
+			logger.info(f"Update Success: {results.update_success}" + (f" / Failed: {results.update_error}" if results.update_error else ""))
+			logger.info(f"Delete Success: {results.delete_success}" + (f" / Failed: {results.delete_error}" if results.delete_error else ""))
+			logger.info(f"Net Change: {_human_readable_size(results.byte_diff)}")
 
 		if results.err_count:
 			logger.info("")
 			logger.info(f"Finished with {results.err_count} errors.")
-			logger.info(f"See the log at {log_path} for details.")
+			logger.info(f"See the log at {log_file} for details.")
 		else:
 			logger.info("")
 			logger.info("Finished successfully.")
 
 		return results
 
-def _fnmatch(path, pattern):
-	if path.count(os.sep) != pattern.count(os.sep):
-		return False
-	return fnmatch(path, pattern)
+class _Filter:
+	def __init__(self, filter_string:str, *, ignore_hidden:bool = False):
+		self.patterns = []
 
-@lru_cache
-def _fnmatch_or_child(path, pattern):
-	if path.count(os.sep) < pattern.count(os.sep):
-		return False
-	path = path.split(os.sep)
-	pattern = pattern.split(os.sep)
-	for a,b in zip(path, pattern):
-		if not fnmatch(a, b):
-			return False
-	return True
+		filter_string = filter_string.strip()
+		for action, patterns in re.findall(r"(\+|-)\s+((?:(?:'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-])\s*)+)", filter_string):
+			action = action == "+"
+			added_parent_dirs = set()
+			for pattern in re.findall(r"'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-]", patterns):
+				if pattern[0] == "'" or pattern[0] == "\"":
+					pattern = pattern[1:-1]
+				if pattern[:2] == "./":
+					pattern = pattern[2:]
+				#if pattern == "**":
+				#	pattern = "**/*"
 
-def _pattern(pat):
-	if "**" in pat:
-		raise ValueError(f"Recursive globs ('**') are not supported in pattern arguments to include/exclude: {pat}")
-	if pat == ".." or pat.startswith(f"..{os.sep}") or f"{os.sep}..{os.sep}" in pat or pat.endswith(f"{os.sep}.."):
-		raise ValueError(f"Parent directories ('..') are not supported in pattern arguments to include/exclude: {pat}")
-	if os.path.isabs(pat):
-		raise ValueError(f"Absolute paths are not supported as arguments to include/exclude: {path}")
-	pattern = SimpleNamespace()
-	pattern.trailing_slash = pat[-1] == "/" or pat[-1] == "\\"
-	pattern.current_dir    = pat.startswith("./") or pat.startswith(".\\")
-	pattern.extension      = "." in pat[1:-1] and pat[-1] != "."
-	pattern.pat            = os.path.normpath(pat)
-	pattern.multipart      = os.sep in pattern.pat
-	return pattern
+				if pattern == ".." or pattern.startswith(f"..{os.sep}") or f"{os.sep}..{os.sep}" in pattern or pattern.endswith(f"{os.sep}.."):
+					raise ValueError(f"Parent directories ('..') are not supported in pattern arguments to include/exclude: {pattern}")
+				if os.path.isabs(pattern):
+					raise ValueError(f"Absolute paths are not supported as arguments to include/exclude: {pattern}")
 
-def _listdir(root, *, include=[], exclude=[], ignore_missing=False, all_dir_patterns_are_paths=True):
+				regex = glob.translate(pattern, recursive=True, include_hidden=(not ignore_hidden))
+				reobj = re.compile(regex)
+				self.patterns.append((action, reobj))
+
+				# include parent dirs for each include pattern
+				if action:
+					while True:
+						pattern = os.path.dirname(pattern)
+						if pattern == "":
+							break
+						if pattern in added_parent_dirs:
+							break
+						added_parent_dirs.add(pattern)
+						regex = glob.translate(pattern + os.sep, recursive=True, include_hidden=True)
+						reobj = re.compile(regex)
+						self.patterns.append((action, reobj))
+
+	def filter(self, relpath:str, default:bool = False):
+		for action, reobj in self.patterns:
+			if reobj.match(relpath):
+				#print(f"{action=} {pattern=} {relpath=}")
+				return action
+		return default
+
+class _FileList:
 	'''
-	Retrieves file relative paths, sizes, and mtimes for files inside a directory. (All "relative paths" are relative to `root`.)
-
-	If `include` is supplied, then the output will be a concatenation of `root` with each relative path in `include`.
-	Otherwise, the output will be a recursive listing of all files in `root`, excluding files indicated by `exclude`.
+	Retrieves file relative paths (relative to `root`), sizes, and mtimes for all descendant files inside a directory.
 
     Args
-		root (str)            : The directory to search.
-		include (list)        : A list of relative paths of files to include in the output. Wildcards are not supported at this time. (Defaults to `[]`.)
-		exclude (list)        : A list of names and relative paths to ignore while searching recursively. (Defaults to `[]`.)
-		ignore_missing (bool) : Whether to ignore paths made using `include` that point to non-existent files. If False, this will raise a `ValueError` instead. (Defaults to `False`.)
-		all_dir_patterns_are_paths (bool) : Whether to treat all directory patterns as relative paths. (Defaults to `True`.)
-
-	Returns
-		A SimpleNamespace containing two fields: `relpath_stats` and `empty_dirs`. `relpath_stats` is a `dict` with keys being each file's relative path and values being a `namedtuple` of file size (`size`) and modtime (`mtime`). `empty_dirs` is a set of relative paths to empty directories.
-
-	Raises
-		ValueError: If `ignore_missing` is `False` and any file indicated by a relative path in `include` does not exist.
+		root (Path)            : The directory to search.
+		filter (str)           : The filter to include/exclude files and directories. Include entries by preceding a space-separated list with "+", and exclude with "-". Included files will be copied, while included directories will be searched. Each pattern ending with a slash will only apply to directories. Otherise the pattern will only apply to files. (Defaults to `+ **/*/ **/*`.)
+		ignore_hidden (bool)   : Whether to skip hidden files by default. If `True`, then wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., "**/.*") will still match these entries. (Defaults to `False`.)
+		follow_symlinks (bool) : Whether to follow symbolic links under `src` and `dst`. Note that `src` and `dst` themselves will be followed if either is a symlink. (Defaults to `False`.)
 	'''
-	Metadata = namedtuple("Metadata", ["size", "mtime"])
 
-	file_list = SimpleNamespace()
-	file_list.relpath_stats = {}
-	file_list.empty_dirs = set()
-	#file_list.nonempty_dirs = set()
-	file_list._scan_count = 0 # for debugging
+	def __init__(self, root:Path, *, filter:str = "+ **/*/ **/*", ignore_hidden:bool = False, follow_symlinks:bool = False):
+		self.root             : Path = root
+		self.relpath_to_stats : dict[str, Metadata] = {}
+		self.real_names       : dict[str, str] = {}
+		self.empty_dirs       : set[str] = set()
+		#self.nonempty_dirs   : set[str] = set()
+		self.visited_inodes   : set[int] = set()
 
-	if isinstance(include, str):
-		include = [include]
-	if isinstance(exclude, str):
-		exclude = [exclude]
+		Metadata = namedtuple("Metadata", ["size", "mtime"])
 
-	# categorize include patterns
-	include_dirnames  = set()
-	include_dirpaths  = set() # TODO include_dir_relpaths
-	include_filenames = set()
-	include_filepaths = set() # TODO include_file_relpaths
-	for pat in include:
-		pattern = _pattern(pat)
-		if pattern.trailing_slash:
-			# dir only
-			if pattern.current_dir or pattern.multipart:
-				include_dirpaths.add(pattern.pat)
-			else:
-				include_dirnames.add(pattern.pat)
-		elif pattern.extension:
-			if pattern.current_dir or pattern.multipart:
-				include_filepaths.add(pattern.pat)
-			else:
-				include_filenames.add(pattern.pat)
-		else:
-			if pattern.current_dir or pattern.multipart:
-				include_dirpaths.add(pattern.pat)
-				include_filepaths.add(pattern.pat)
-			else:
-				include_dirnames.add(pattern.pat)
-				include_filenames.add(pattern.pat)
+		f = _Filter(filter, ignore_hidden=ignore_hidden)
 
-	# categorize exclude patterns
-	exclude_dirnames  = set()
-	exclude_dirpaths  = set() # TODO exclude_dir_relpaths
-	exclude_filenames = set()
-	exclude_filepaths = set() # TODO exclude_file_relpaths
-	for pat in exclude:
-		pattern = _pattern(pat)
-		if pattern.trailing_slash:
-			# dir only
-			if pattern.current_dir or pattern.multipart:
-				exclude_dirpaths.add(pattern.pat)
-			else:
-				exclude_dirnames.add(pattern.pat)
-		elif pattern.extension:
-			if pattern.current_dir or pattern.multipart:
-				exclude_filepaths.add(pattern.pat)
-			else:
-				exclude_filenames.add(pattern.pat)
-		else:
-			if pattern.current_dir or pattern.multipart:
-				exclude_dirpaths.add(pattern.pat)
-				exclude_filepaths.add(pattern.pat)
-			else:
-				exclude_dirnames.add(pattern.pat)
-				exclude_filenames.add(pattern.pat)
+		for dir, subdirnames, file_entries in direntry_walk(root, followlinks=follow_symlinks):
+			logger.debug(f"scanning: {dir}")
 
-	# if treating all dirnames as dirpaths
-	if all_dir_patterns_are_paths:
-		include_dirpaths |= include_dirnames
-		include_dirnames = set()
-		exclude_dirpaths |= exclude_dirnames
-		exclude_dirnames = set()
+			if follow_symlinks:
+				inode = os.stat(dir).st_ino
+				if inode in self.visited_inodes:
+					raise ValueError(f"Symlink circular reference: {dir}")
+				self.visited_inodes.add(inode)
 
-	# gather dirs for a narrow search
-	# if filename or dirname patterns exists then do a full scan
-	ancestors_of_included = set()
-	if not include_filenames and not include_dirnames:
-		for dir in include_dirpaths:
-			while dir:
-				ancestors_of_included.add(dir)
-				dir = os.path.dirname(dir)
-		for dir in include_filepaths:
-			while True:
-				dir = os.path.dirname(dir)
-				ancestors_of_included.add(dir)
-				if not dir:
-					break
+			# sorting may be needed if _listdir is changed to yield folder-by-folder
+			#subdirnames.sort()
+			#file_entries.sort()
 
-	logger.debug(f"{ancestors_of_included=}")
-	logger.debug(f"{include_dirnames=}")
-	logger.debug(f"{include_dirpaths=}")
-	logger.debug(f"{include_filenames=}")
-	logger.debug(f"{include_filepaths=}")
-	logger.debug(f"{exclude_dirnames=}")
-	logger.debug(f"{exclude_dirpaths=}")
-	logger.debug(f"{exclude_filenames=}")
-	logger.debug(f"{exclude_filepaths=}")
-	logger.debug(f"{ancestors_of_included=}")
-	logger.debug("***")
+			dir_relpath = os.path.relpath(dir, root)
+			normed_dir_relpath = os.path.normcase(dir_relpath)
 
-	used_path_patterns = set()
-
-	in_included_relpath_dir = False
-	depth_in_included_relpath_dir = 9999
-
-	for dir, subdirnames, file_entries in direntry_walk(root):
-		logger.debug("_listdir: in " + dir)
-		file_list._scan_count += 1
-
-		# sorting may be needed if _listdir is changed to yield folder-by-folder
-		#subdirnames.sort()
-		#file_entries.sort()
-
-		dirname     = os.path.basename(dir)
-		dir_relpath = os.path.relpath(dir, root)
-		depth       = dir_relpath.count(os.sep)
-
-		if depth <= depth_in_included_relpath_dir:
-			if any(_fnmatch_or_child(dir_relpath, pat) for pat in include_dirpaths):
-				in_included_relpath_dir = True
-				depth_in_included_relpath_dir = depth
-			else:
-				in_included_relpath_dir = False
-				depth_in_included_relpath_dir = 9999
-
-		# determine which dirpath pattern includes this dir, if any
-		# TODO? move into depth calc section
-		if not ignore_missing and depth == depth_in_included_relpath_dir:
-			for pat in include_dirpaths:
-				if _fnmatch(dir_relpath, pat): #okay to use fnmatch
-					used_path_patterns.add(pat)
-					break
-
-		# determine if we're in an explicitly included dir
-		# this may not be the case during full searches (i.e., searches with name patterns)
-		in_included_dir =	(in_included_relpath_dir) or \
-							(include_dirnames and any(_fnmatch(dirname, pat) for pat in include_dirnames))
-
-		# catalog empty directory
-		if not file_entries and not subdirnames:
-			file_list.empty_dirs.add(dir_relpath)
-			continue
-		#else:
-		#	file_list.nonempty_dirs.add(dir_relpath)
-
-		# in case _listdir is given a recurse option
-		#if not recursive:
-		#	subdirnames[:] = []
-
-		# prune search tree
-		i = 0
-		while i < len(subdirnames):
-			# prune by excluded dir names
-			subdirname = subdirnames[i]
-			if any(_fnmatch(subdirname, pat) for pat in exclude_dirnames):
-				del subdirnames[i]
+			# catalog empty directory
+			if not file_entries and not subdirnames:
+				self.empty_dirs.add(dir_relpath)
+				self.real_names[normed_dir_relpath] = dir_relpath
 				continue
+			#else:
+			#	self.nonempty_dirs.add(dir_relpath)
 
-			# prune by excluded dir path
-			subdir_path = os.path.join(dir, subdirname)
-			subdir_relpath = os.path.relpath(subdir_path, root)
-			if any(_fnmatch(subdir_relpath, pat) for pat in exclude_dirpaths):
-				del subdirnames[i]
-				continue
+			# prune search tree
+			i = 0
+			while i < len(subdirnames):
+				# symlinks are encountered here but they aren't followed unless followlinks is True
+				subdirname = subdirnames[i]
+				subdir_path = os.path.join(dir, subdirname)
+				subdir_relpath = os.path.relpath(subdir_path, root)
+				if not f.filter(subdir_relpath + os.sep):
+					del subdirnames[i]
+					continue
+				i += 1
 
-			# prune search tree during narrow searches (i.e., searches with only relpath patterns)
-			# paths need to be a child to an included dir or a parent to an included entry (file or dir)
-			if not in_included_dir and ancestors_of_included and not any(_fnmatch(subdir_relpath, pat) for pat in ancestors_of_included):
-				del subdirnames[i]
-				continue
-			i += 1
+			# prune files
+			for entry in file_entries:
+				# ignore file symlinks for now, shutil.copy2() would follow and copy their contents if included in the output
+				if entry.is_symlink():
+					continue
+				filename = entry.name
+				file_path = os.path.join(dir, filename)
+				file_relpath = os.path.relpath(file_path, root)
+				normed_file_relpath = os.path.normcase(file_relpath)
+				if (f.filter(file_relpath)):
+					meta = Metadata(entry.stat().st_size, entry.stat().st_mtime)
+					self.relpath_to_stats[normed_file_relpath] = meta
+					self.real_names[normed_file_relpath] = file_relpath
 
-		for entry in file_entries:
-			filename = entry.name
-			# prune by excluded file names
-			if any(_fnmatch(filename, pat) for pat in exclude_filenames):
-				continue
+def _operations(
+		src_files        : _FileList,
+		dst_files        : _FileList,
+		*,
+		trash_root       : Path | None,
+		rename_threshold : int  | None,
+		metadata_only    : bool
+	):
+	'''Generator of the list of filesystem operations to perform for this backup.'''
 
-			# prune by excluded file path
-			file_path = os.path.join(dir, filename)
-			file_relpath = os.path.relpath(file_path, root)
-			if any(_fnmatch(file_relpath, pat) for pat in exclude_filepaths):
-				continue
+	assert trash_root is None or isinstance(trash_root, Path)
 
-			# determine if this is an explicitly included file
-			included_file = (include_filepaths and any(_fnmatch(file_relpath, pat) for pat in include_filepaths)) or \
-							(include_filenames and any(_fnmatch(filename, pat) for pat in include_filenames))
-
-			# determine which filepath pattern includes this file, if any
-			if not ignore_missing:
-				for pat in include_filepaths:
-					if _fnmatch(file_relpath, pat):
-						used_path_patterns.add(pat)
-						break
-
-			# ignore file if it is not specified by a file-select pattern or dir-select pattern
-			if include and not in_included_dir and not included_file:
-				continue
-
-			# file meets all criteria, add it to the return result
-			file_list.relpath_stats[file_relpath] = Metadata(entry.stat().st_size, entry.stat().st_mtime)
-
-	# raise error if any explicitly included files were not found during the search, unless ignore_missing is True
-	if not ignore_missing:
-		unused_path_patterns = (include_dirpaths | include_filepaths) - used_path_patterns
-		if unused_path_patterns:
-			raise ValueError(f"Did not find these entries for backup: {unused_path_patterns}")
-
-	return file_list
-
-def _operations(src_files, dst_files, src_root, dst_root, trash_dir, rename_threshold, metadata_only):
-	src_relpath_stats = src_files.relpath_stats
-	dst_relpath_stats = dst_files.relpath_stats
+	src_relpath_stats = src_files.relpath_to_stats
+	dst_relpath_stats = dst_files.relpath_to_stats
 
 	src_relpaths = set(src_relpath_stats.keys())
 	dst_relpaths = set(dst_relpath_stats.keys())
@@ -509,16 +427,19 @@ def _operations(src_files, dst_files, src_root, dst_root, trash_dir, rename_thre
 
 				# Ignore if last 1kb do not match
 				if not metadata_only:
-					on_dst = os.path.join(dst_root, rename_from)
-					on_src = os.path.join(src_root, rename_to)
+					on_dst = dst_files.root / rename_from
+					on_src = src_files.root / rename_to
 					if not _last_bytes(on_src) == _last_bytes(on_dst):
 						continue
 
-				src = os.path.join(dst_root, rename_from)
-				dst = os.path.join(dst_root, rename_to)
-
 				src_only_relpaths.remove(rename_to)
 				dst_only_relpaths.remove(rename_from)
+
+				rename_from = dst_files.real_names[rename_from]
+				rename_to = dst_files.real_names[rename_to]
+
+				src = dst_files.root / rename_from
+				dst = dst_files.root / rename_to
 
 				yield ("R", src, dst, 0, f"R {rename_from} -> {rename_to}")
 
@@ -527,109 +448,61 @@ def _operations(src_files, dst_files, src_root, dst_root, trash_dir, rename_thre
 				continue
 
 	# Deleting must be done first or backing up a.jpg -> a.JPG (or similar) on Windows will fail
-	if trash_dir:
+	if trash_root is not None:
 		for dst_relpath in dst_only_relpaths:
-			src = os.path.join( dst_root, dst_relpath)
-			dst = os.path.join(trash_dir, dst_relpath)
+			dst_relpath_real = dst_files.real_names[dst_relpath]
+			src = dst_files.root / dst_relpath_real
+			dst = trash_root     / dst_relpath_real
 			byte_diff = -dst_relpath_stats[dst_relpath][0]
-			yield ("-", src, dst, byte_diff, f"- {dst_relpath}")
+			yield ("-", src, dst, byte_diff, f"- {dst_relpath_real}")
 
 	for src_relpath in src_only_relpaths:
-		src = os.path.join(src_root, src_relpath)
-		dst = os.path.join(dst_root, src_relpath)
+		src_relpath_real = src_files.real_names[src_relpath]
+		src = src_files.root / src_relpath_real
+		dst = dst_files.root / src_relpath_real
 		byte_diff = src_relpath_stats[src_relpath].size
-		yield ("+", src, dst, byte_diff, f"+ {src_relpath}")
+		yield ("+", src, dst, byte_diff, f"+ {src_relpath_real}")
 
 	for relpath in both_relpaths:
-		src = os.path.join(src_root, relpath)
-		dst = os.path.join(dst_root, relpath)
+		src_relpath_real = src_files.real_names[relpath]
+		dst_relpath_real = dst_files.real_names[relpath]
+		src = src_files.root / src_relpath_real
+		dst = dst_files.root / dst_relpath_real
 		byte_diff = src_relpath_stats[relpath].size - dst_relpath_stats[relpath].size
 		src_time = src_relpath_stats[relpath].mtime
 		dst_time = dst_relpath_stats[relpath].mtime
 		if src_time > dst_time:
-			yield ("U", src, dst, byte_diff, f"U {relpath}")
+			yield ("U", src, dst, byte_diff, f"U {dst_relpath_real}")
 		elif src_time < dst_time:
-			logger.warn(f"Working copy is older than backed-up copy, skipping update: {relpath}")
+			logger.warning(f"Working copy is older than backed-up copy, skipping update: {relpath}")
 
 	# Empty directories
 	src_only_empty_dirs = src_files.empty_dirs.difference(dst_files.empty_dirs)#.difference(dst_files.nonempty_dirs)
 	for relpath in src_only_empty_dirs:
-		dst = os.path.join(dst_root, relpath)
-		if not os.path.isdir(dst):
-			yield ("D+", None, dst, 0, f"+ {relpath}{os.sep}")
+		dst_relpath_real = dst_files.real_names[relpath]
+		dst = dst_files.root / dst_relpath_real
+		if not dst.exists():
+			yield ("D+", None, dst, 0, f"+ {dst_relpath_real}{os.sep}")
+		elif not dst.is_dir():
+			logger.error(f"FileExistsError: Could not create dir: {dst_relpath_real}")
 	dst_only_empty_dirs = dst_files.empty_dirs.difference(src_files.empty_dirs)#.difference(src_files.empty_dirs)
 	for relpath in dst_only_empty_dirs:
-		src = os.path.join(dst_root, relpath)
-		if not os.listdir(src):
-			yield ("D-", src, None, 0, f"- {relpath}{os.sep}")
+		dst_relpath_real = dst_files.real_names[relpath]
+		src = dst_files.root / dst_relpath_real
+		if not any(src.iterdir()):
+			yield ("D-", src, None, 0, f"- {dst_relpath_real}{os.sep}")
 
-def _copy(src, dst):
-	'''Copy src to dst, keeping metadata, and overwriting any existing file.'''
-	if src.lower() == dst.lower(): #if os.path.samefile(src, dst):
-		raise ValueError(f"Same file: {src} -> {dst}")
-	delete_tmp = False
-	dst_tmp = dst + ".tempcopy"
-	try:
-		# Copy into a temp file, with metadata
-		dir = os.path.dirname(dst)
-		os.makedirs(dir, exist_ok=True)
-		shutil.copy2(src, dst_tmp)
-		delete_tmp = True
-		try:
-			# Rename the temp file into the dest file
-			os.replace(dst_tmp, dst)
-			delete_tmp = False
-		except PermissionError as e:
-			# Remove read-only flag and try again
-			make_readonly = False
-			try:
-				if not (os.stat(dst).st_mode & stat.S_IREAD):
-					raise e
-				os.chmod(dst, stat.S_IWRITE)
-				make_readonly = True
-				os.replace(dst_tmp, dst)
-				delete_tmp = False
-			finally:
-				if make_readonly:
-					os.chmod(dst, stat.S_IREAD)
-	finally:
-		# Remove the temp copy if there are any errors
-		if delete_tmp:
-			os.remove(dst_tmp)
-
-def _move(src, dst, *, delete_empty_dirs=True, root=""):
-	'''Move src to dst (on the same filesystem), failing if dst exists.'''
-	# dst file must either not exist or differ from src by case
-	if dst == src:
-		raise ValueError(f"Same file: {src} -> {dst}")
-	if os.path.exists(dst) and ("nt" not in os.name or src.lower() != dst.lower()):
-		raise FileExistsError(f"File already exists: {src} -> {dst}")
-	# move the file
-	dir = os.path.dirname(dst)
-	os.makedirs(dir, exist_ok=True)
-	os.rename(src, dst)
-	# delete empty directories left after the move
-	if delete_empty_dirs:
-		try:
-			dir = src
-			while True:
-				dir = os.path.dirname(dir)
-				if not os.listdir(dir):
-					relpath = os.path.relpath(dir, root)
-					logger.info(f"- {relpath}{os.sep}")
-					os.rmdir(dir)
-				else:
-					break
-		except OSError:
-			logger.error(f"{e.__class__.__name__}: - {relpath}{os.sep}")
-
-def _reverse_dict(old_dict):
+def _reverse_dict(old_dict:dict[Any, Any]) -> dict[Any, Any]:
 	'''
-	Reverses a `dict`, allowing quick retrieval of keys from values.
+	Reverses a `dict` by swapping keys and values. If a value in `old_dict` appears more than once, then the corresponding key in the reversed `dict` will point to a value of `None`.
 
-	If a value in `old_dict` appears more than once, then the corresponding key in the reversed dict will point to a value of `None`.
+	>>> _reverse_dict({"a":1, "b":2, "c":2})[1]
+	'a'
+	>>> _reverse_dict({"a":1, "b":2, "c":2})[2] is None
+	True
 	'''
-	reversed = {}
+
+	reversed:dict[Any, Any] = {}
 	for key, val in old_dict.items():
 		if val in reversed:
 			reversed[val] = None
@@ -637,200 +510,288 @@ def _reverse_dict(old_dict):
 			reversed[val] = key
 	return reversed
 
-def _last_bytes(file_path, n=1024):
-	file_size = os.path.getsize(file_path)
+def _copy(src:Path, dst:Path, *, exist_ok:bool = True) -> None:
+	'''Copy file from `src` to `dst`, keeping timestamp metadata. `exist_ok` must be `True` if `dst` exists. Otherwise this method will raise a `FileExistsError`.'''
+
+	if dst.exists():
+		if not exist_ok:
+			raise FileExistsError(f"Cannot copy, dst exists: {src} -> {dst}")
+		if not dst.is_file():
+			raise FileExistsError(f"Cannot copy, dst is not a file: {src} -> {dst}")
+		elif src.samefile(dst):
+			raise FileExistsError(f"Same file: {src} -> {dst}")
+
+	delete_tmp = False
+	dst_tmp = dst.with_name(dst.name + ".tempcopy")
+	try:
+		# Copy into a temp file, with metadata
+		dir = dst.parent
+		dir.mkdir(exist_ok=True)
+		shutil.copy2(src, dst_tmp)
+		delete_tmp = True
+		try:
+			# Rename the temp file into the dest file
+			dst_tmp.replace(dst) # same as os.replace
+			delete_tmp = False
+		except PermissionError as e:
+			# Remove read-only flag and try again
+			make_readonly = False
+			try:
+				if not (dst.stat().st_mode & stat.S_IREAD):
+					raise e
+				dst.chmod(stat.S_IWRITE)
+				make_readonly = True
+				dst_tmp.replace(dst)
+				delete_tmp = False
+			finally:
+				if make_readonly:
+					dst.chmod(stat.S_IREAD)
+	finally:
+		# Remove the temp copy if there are any errors
+		if delete_tmp:
+			dst_tmp.unlink() # same as os.remove
+
+def _move(src:Path, dst:Path, *, exist_ok:bool = False, delete_empty_dirs_under:Path|None = None) -> None:
+	'''
+	Move file from `src` to `dst`. `exist_ok` must be `True` if `dst` exists. Otherwise this method will raise a `FileExistsError`.
+
+	If `delete_empty_dirs_under` is supplied, then any empty directories created during this file move (and under this root directory) will be deleted.
+	'''
+
+	if dst.exists():
+		if not exist_ok:
+			raise FileExistsError(f"Cannot move, dst exists: {src} -> {dst}")
+		if not dst.is_file():
+			raise FileExistsError(f"Cannot move, dst is not a file: {src} -> {dst}")
+		elif src.samefile(dst):
+			raise FileExistsError(f"Same file: {src} -> {dst}")
+
+	# move the file
+	dir = dst.parent
+	dir.mkdir(exist_ok=True)
+	src.rename(dst)
+
+	# delete empty directories left after the move
+	if delete_empty_dirs_under is not None:
+		_delete_empty_dirs(src.parent, root=delete_empty_dirs_under)
+
+def _delete_empty_dirs(dir:Path, *, root:Path) -> None:
+	'''Iteratively delete empty directories, starting with `dir` and moving up to (but not including) `root`.'''
+
+	if not dir.is_dir():
+		raise ValueError(f"Expected a dir: {dir}")
+	if not dir.is_relative_to(root):
+		raise ValueError(f"root ({root}) is not an ancestor of dir ({dir})")
+	#if any(dir.iterdir()):
+	#	raise ValueError(f"Dir is not empty: {dir}")
+	try:
+		while dir != root and not any(dir.iterdir()):
+			relpath = dir.relative_to(root)
+			logger.debug(f"- {relpath}{os.sep}")
+			dir.rmdir()
+			dir = dir.parent
+	except OSError as e:
+		logger.error(f"{e.__class__.__name__}: Failed to delete: {relpath}{os.sep}")
+
+def _last_bytes(file_path:Path, n:int = 1024) -> bytes:
+	'''Reads and returns the last `n` bytes of a file.'''
+
+	file_size = file_path.stat().st_size
 	bytes_to_read = file_size if n > file_size else n
 	with open(file_path, "rb") as f:
 		f.seek(-bytes_to_read, os.SEEK_END)
 		return f.read()
 
-def _human_readable_size(num_bytes):
+def _human_readable_size(num_bytes:int) -> str:
+	'''
+	Translates `num_bytes` into a human-readable size.
+
+	>>> _human_readable_size(1023)
+	'1023 bytes'
+	>>> _human_readable_size(1024)
+	'1 KB'
+	>>> _human_readable_size(2.1 * 1024 * 1024)
+	'2 MB'
+	'''
+
 	sign = "-" if num_bytes < 0 else ""
 	num_bytes = abs(num_bytes)
 	units = ["bytes", "KB", "MB", "GB", "TB", "PB"]
 	i = 0
 	while num_bytes >= 1024 and i < len(units) - 1:
-		num_bytes /= 1024
+		num_bytes //= 1024
 		i += 1
 	return f"{sign}{round(num_bytes)} {units[i]}"
 
 class _LogManager:
-	def __init__(self ,*, suppress_stdout, suppress_stderr):
-		self._log_path = None
-		self.final_log_path = None
-		self.log_handler_file = None
+	'''ContextManager that handles creation the log file and records whether to suppress stdout.'''
 
-		self.suppress_stdout = suppress_stdout
-		self.suppress_stderr = suppress_stderr
-		self.log_handler_console = None
+	def __init__(self ,*, suppress_stdout:bool = False, suppress_stderr:bool = False):
+		self._log_file           : Path | None = None # the working copy of the log file
+		self.final_log_file      : Path | None = None # where to move the working copy upon completion
+		self.log_handler_file    : logging.FileHandler | None = None
+
+		self.suppress_stdout     : bool = suppress_stdout
+		self.suppress_stderr     : bool = suppress_stderr
+		self.log_handler_console = _ConsoleHandler(self)
+
+		formatter = logging.Formatter("%(message)s")
+		self.log_handler_console.setFormatter(formatter)
+		self.log_handler_console.setLevel(logging.INFO)
+		logger.addHandler(self.log_handler_console)
 
 	@property
-	def log_path(self):
-		return self._log_path
+	def log_file(self):
+		return self._log_file
 
-	@log_path.setter
-	def log_path(self, val):
+	@log_file.setter
+	def log_file(self, path:Path | None) -> None:
 		# file log
-		if val:
-			self.final_log_path = val
-			with tempfile.NamedTemporaryFile(mode="w+", encoding='utf-8', delete=False) as tmp_log:
-				self._log_path = tmp_log.name
+		if path is not None:
+			self.final_log_file = path
+			with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", delete=False) as tmp_log:
+				self._log_file = Path(tmp_log.name)
 			formatter = logging.Formatter("%(levelname)s: %(message)s")
-			self.log_handler_file = logging.FileHandler(self.log_path, encoding='utf-8')
+			self.log_handler_file = logging.FileHandler(self.log_file, encoding="utf-8")
 			self.log_handler_file.setFormatter(formatter)
 			self.log_handler_file.setLevel(logging.DEBUG)
 			logger.addHandler(self.log_handler_file)
-			self.log_handler_console.log_file = val
-		elif self.log_handler_file:
+			self.log_handler_console.log_file = path
+		elif self.log_handler_file is not None:
+			assert self.final_log_file is not None
 			logger.removeHandler(self.log_handler_file)
 			self.log_handler_file.close()
-			os.replace(self.log_path, self.final_log_path)
-			self._log_path = None
-			self.final_log_path = None
+			self.log_file.replace(self.final_log_file)
+			self._log_file = None
+			self.final_log_file = None
 			self.log_handler_file = None
 			self.log_handler_console.log_file = None
 
 
 	def __enter__(self):
-		# console log
-		if not self.suppress_stdout or not self.suppress_stderr:
-			formatter = logging.Formatter("%(message)s")
-			self.log_handler_console = _ConsoleHandler(self.suppress_stdout, self.suppress_stderr)
-			self.log_handler_console.setFormatter(formatter)
-			self.log_handler_console.setLevel(logging.INFO)
-			logger.addHandler(self.log_handler_console)
-		return self
+		pass
 
-	def __exit__(self, exc_type, exc_value, tb):
+	def __exit__(self, exc_type, exc_value, tb) -> None:
 		if exc_type:
 			if exc_type is TypeError or exc_type is ValueError:
 				logger.critical(f"Input Error: {exc_value}")
 			elif exc_type is KeyboardInterrupt:
-				logger.warn(f"Cancelled by user.")
+				logger.warning(f"Cancelled by user.")
 			else:
 				logger.critical(f"{exc_type.__name__}: {exc_value}")
 				logger.debug(traceback.format_exc())
 
-		if self.log_handler_file:
+		if self.log_handler_file is not None:
+			assert self.final_log_file is not None
 			logger.removeHandler(self.log_handler_file)
 			self.log_handler_file.close()
-			os.replace(self.log_path, self.final_log_path)
-			self.log_path = self.final_log_path
+			self.log_file.replace(self.final_log_file)
+			self.log_file = self.final_log_file
+			self.final_log_file = None
+			self.log_handler_file = None
+			self.log_handler_console.log_file = None
 
-		if self.log_handler_console:
-			self.log_handler_console.close()
-			logger.removeHandler(self.log_handler_console)
+		self.log_handler_console.close()
+		logger.removeHandler(self.log_handler_console)
 
 class _ConsoleHandler(logging.Handler):
-	def __init__(self, suppress_stdout, suppress_stderr, max_err_recap=10):
+	'''Handler for log messages presented to the user on the command line.'''
+
+	def __init__(self, log_manager : _LogManager, *, max_err_recap : int = 10):
 		super().__init__()
-		self.suppress_stdout = suppress_stdout
-		self.suppress_stderr = suppress_stderr
-		self.max_err_recap = max_err_recap
-		self.log_records = []
-		self.count_errs = 0
-		self.critical_err = False
-		self.log_file = None
+		self.log_manager   : _LogManager = log_manager
+		self.max_err_recap : int = max_err_recap
+		self.errs          : list[str] = []
+		self.count_errs    : int = 0
+		self.critical_err  : bool = False
+		self.log_file      : Path | None = None
 
 	def emit(self, record):
 		msg = self.format(record)+"\n"
 		if record.levelname == "DEBUG" or record.levelname == "INFO":
-			if not self.suppress_stdout:
+			if not self.log_manager.suppress_stdout:
 				sys.stdout.write(msg)
 		else:
 			self.count_errs += 1
-			if self.count_errs < self.max_err_recap:
-				self.log_records.append(msg)
-			if not self.suppress_stderr:
+			if len(self.errs) < self.max_err_recap:
+				self.errs.append(msg)
+			if not self.log_manager.suppress_stderr:
 				sys.stderr.write(msg)
 			if record.levelname == "CRITICAL":
 				self.critical_err = True
 
 	def close(self):
-		if not self.suppress_stdout:
-			if 0 < self.count_errs <= self.max_err_recap and not self.critical_err:
+		if not self.log_manager.suppress_stdout:
+			if self.log_file is not None:
+				sys.stdout.write(f"This output is saved at {self.log_file}.\n")
+			sys.stdout.write(f"There were {self.count_errs} errors.\n")
+			if 0 < len(self.errs) <= self.max_err_recap and not self.critical_err:
 				sys.stdout.write("Errors are reprinted below for convenience:\n")
-				for err in self.log_records:
+				for err in self.errs:
 					sys.stdout.write(err)
 
 class _ArgParser:
+	'''Argument parser for when this python file is run with arguments instead of an imported module.'''
+
 	parser = argparse.ArgumentParser(
 		description="Copy new and updated files from one directory to another, update renamed files' names to match where possible, and optionally delete non-matching files.",
-		epilog="(c) 2025 Joe Walter")
+		epilog="(c) 2025 Joe Walter"
+	)
 
 	parser.add_argument("src_root", help="The root directory to copy files from.")
 	parser.add_argument("dst_root", help="The root directory to copy files to.")
+	parser.add_argument("-t", "--trash-root", metavar="path", nargs="?", type=str, default=None, const="auto", help="The root directory to move 'extra' files (those that are in `dst_root` but not `src_root`). Must be on the same filesystem as `dst_root`. If set to \"auto\", then a directory will automatically be made next to `dst_root`. Extra files will not be moved if this option is omitted.")
 
-	parser.add_argument("-i", "--include", metavar="name_or_relpath", nargs="*", default=[], help="A whitelist of relative paths that will exclude all other files and directories from the backup. Non-recursive globs (e.g., *.txt) are supported.")
-	parser.add_argument("-x", "--exclude", metavar="name_or_relpath", nargs="*", default=[], help=f"A blacklist of names and/or relative paths indicating files and directories to ignore. The blacklist is applied to entries in src_root and dst_root, except for those indicated by --include. Entries ending with {os.sep} will be treated as a directory only.")
-	parser.add_argument("-t", "--trash-root", metavar="path", nargs="?", default=None, help="The root directory to place files that are 'deleted' from dst_root. Must be on the same filesystem as dst_root. Files will not be 'deleted' if this option is omitted.")
-	parser.add_argument("--ignore-missing", action="store_true", default=False, help="Indicate the relative paths indicated by --include may point to non-existent files.")
-	parser.add_argument("-r", "--rename-threshold", metavar="size", type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root that were renamed in src_root. Renamed files below this threshold will be simply deleted in dst_root and their replacements created.")
+	parser.add_argument("-f", "--filter", metavar="filter_string", nargs=1, type=str, default="+ **/*/ **/*", help="The filter to include/exclude files and directories. Similar to rsync, the format of the filter string is: (+ or -), followed by a list of one of more relative path patterns, and otionally repeat from the start. Including (+) or excluding (-) of entries is determined by the preceding symbol of the first matching pattern. Included files will be copied, while included directories will be searched. Each Pattern ending with \"/\" will apply to directories only. Otherise the pattern will apply only to files. (Defaults to \"+ **/*/ **/*\", which searches all directories and copies all files.)")
+	parser.add_argument("--ignore-hidden", action="store_true", default=False, help="Whether to skip hidden files by default. If `True`, then wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., \"**/.*\") will still match these entries. (Defaults to `False`.)")
+	parser.add_argument("-r", "--rename-threshold", metavar="size", nargs=1, type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root to match those in src_root. Renamed files below this threshold will be simply deleted in dst_root and their replacements copied over.")
 	parser.add_argument("-m", "--metadata_only", action="store_true", default=False, help="Use only metadata in determining which files in dst_root are the result of a rename. Otherwise, backup will also compare the last 1kb of files.")
 	parser.add_argument("--dry-run", action="store_true", default=False, help="Forgo performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console.")
 
-	group = parser.add_mutually_exclusive_group(required=False)
-	group.add_argument("--log", metavar="path", type=str, default="-", help="File to write log messages to. If this is not supplied, a tempfile will be used for the log, and it will be moved to the user's home directory after the backup is done.")
-	group.add_argument("--no-log", action="store_true", help="Forgo writing to a log.")
+	parser.add_argument("--log", metavar="path", nargs="?", type=str, default=None, const="auto", help="File to write log messages to. If set to \"auto\", then a tempfile will be used for the log, and it will be moved to the user's home directory after the backup is done. If absent, then no logging will be performed.")
 
 	parser.add_argument("-q", action="count", default=0, help="Forgo printing to stdout (-q) and stderr (-qq).")
 
 	@staticmethod
-	def parse(args):
-		if isinstance(args, str):
-			args = args.split()
-		args = _ArgParser.parser.parse_args(args)
+	def parse(args:list[str]) -> argparse.Namespace:
+		parsed_args = _ArgParser.parser.parse_args(args)
+		parsed_args.quiet     = parsed_args.q >= 1
+		parsed_args.veryquiet = parsed_args.q >= 2
+		del parsed_args.q
+		return parsed_args
 
-		args.log_path  = None if args.no_log else args.log
-		args.quiet     = args.q >= 1
-		args.veryquiet = args.q >= 2
+def backup2(args:list[str]) -> Results:
+	'''Run backup with command line arguments.'''
 
-		del args.no_log
-		del args.log
-		del args.q
-
-		return args
-
-def backup2(args):
-	args = _ArgParser.parse(args)
+	parsed_args = _ArgParser.parse(args)
 	return backup(
-		args.src_root,
-		args.dst_root,
-		trash_root       = args.trash_root,
-		exclude          = args.exclude,
-		include          = args.include,
-		ignore_missing   = args.ignore_missing,
-		rename_threshold = args.rename_threshold,
-		metadata_only    = args.metadata_only,
-		dry_run          = args.dry_run,
-		log_path         = args.log_path,
-		quiet            = args.quiet,
-		veryquiet        = args.veryquiet
+		parsed_args.src_root,
+		parsed_args.dst_root,
+		trash            = parsed_args.trash_root,
+		filter           = parsed_args.filter,
+		ignore_hidden    = parsed_args.ignore_hidden,
+		rename_threshold = parsed_args.rename_threshold,
+		metadata_only    = parsed_args.metadata_only,
+		dry_run          = parsed_args.dry_run,
+		log              = parsed_args.log,
+		quiet            = parsed_args.quiet,
+		veryquiet        = parsed_args.veryquiet
 	)
 
-def main():
-	'''
-	Return Codes:
-	0 = Finished OK
-	1 = Unknown error
-	2 = Bad input
-	3 = Finished with OSErrors
-	130 = Cancelled by user
-	'''
+def main() -> None:
 	try:
-		results = backup2(sys.argv[1:])
-		if results.err_count:
-			sys.exit(3)
-		else:
-			sys.exit(0)
+		backup2(sys.argv[1:])
+	except SystemExit:
+		# from argparse
+		pass
+	except (TypeError, ValueError) as e:
+		print(e)
 	except KeyboardInterrupt:
-		sys.exit(130)
-	except (ValueError, TypeError) as e:
-		sys.exit(2)
+		print()
+		print("KeyboardInterrupt")
 	except Exception:
 		print()
 		traceback.print_exc()
-		sys.exit(1)
 
 if __name__ == "__main__":
 	main()
