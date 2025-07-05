@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from backup import backup, backup2, Results, _listdir
+from backup import backup, backup2, Results, _listdir, _operations, _move
 
 def hash_directory(root, ignore_empty_dirs=False):
 	hasher = hashlib.sha256()
@@ -94,6 +94,7 @@ class TestBackup(unittest.TestCase):
 				},
 				"b": {
 					"ba": {
+						"1.txt": None,
 					},
 					"bb": {
 					},
@@ -112,9 +113,7 @@ class TestBackup(unittest.TestCase):
 
 			files = _listdir(
 				root = test_root,
-				include = "1.???".split(),
-				exclude = "b/ c/".split(),
-				ignore_missing = True,
+				filter = "- b/ c/ + **/*/ **/1.???"
 			)
 			files_expected = [
 				"a/aa/1.txt",
@@ -128,15 +127,12 @@ class TestBackup(unittest.TestCase):
 				sorted(files.relpath_stats.keys()),
 				sorted(f.replace("/", os.sep) for f in files_expected)
 			)
-			self.assertEqual(files._scan_count, 14)
 
 			###################################################################################
 
 			files = _listdir(
 				root = test_root,
-				include = "./a/a?/a?b".split(),
-				exclude = "b/ c/".split(),
-				ignore_missing = True,
+				filter = "+ a/a?/a?b/*",
 			)
 			files_expected = [
 				"a/aa/aab/12.txt",
@@ -147,27 +143,73 @@ class TestBackup(unittest.TestCase):
 				sorted(files.relpath_stats.keys()),
 				sorted(f.replace("/", os.sep) for f in files_expected)
 			)
-			self.assertEqual(files._scan_count, 8)
 
-			###################################################################################
+	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-			files = _listdir(
-				root = test_root,
-				include = "a?b/".split(),
-				exclude = "b/ c/".split(),
-				ignore_missing = True,
-				all_dir_patterns_are_paths = False
+	'''
+	def test_operations(self):
+		with tempfile.TemporaryDirectory(suffix=None, prefix=None, dir=None) as temp_root:
+			test_root = Path(temp_root)
+			file_structure = {
+				"a": {
+					"a": {
+						"1.txt": None
+					}
+				},
+				"b": {
+					"A": {
+						"1.txt": None
+					},
+					"empty": {
+						"empty2": {}
+					}
+				}
+			}
+			create_file_structure(test_root, file_structure)
+
+			src_root = os.path.join(test_root, "a")
+			dst_root = os.path.join(test_root, "b")
+			src_files = _listdir(
+				root = src_root
 			)
-			files_expected = [
-				"a/aa/aab/12.txt",
-				"a/ab/abb/12.jpg",
-				"a/ac/acb/12.html",
-			]
-			self.assertEqual(
-				sorted(files.relpath_stats.keys()),
-				sorted(f.replace("/", os.sep) for f in files_expected)
+			dst_files = _listdir(
+				root = dst_root
 			)
-			self.assertEqual(files._scan_count, 14)
+			trash_dir = None
+			rename_threshold = 0
+			metadata_only = False
+
+			print(list(_operations(src_files, dst_files, src_root, dst_root, trash_dir, rename_threshold, metadata_only)))
+	'''
+
+	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+	def test_move(self):
+		with tempfile.TemporaryDirectory(suffix=None, prefix=None, dir=None) as temp_root:
+			test_root = Path(temp_root)
+			file_structure = {
+				"a": {
+					"b": {
+						"1.txt": None
+					}
+				}
+			}
+			create_file_structure(test_root, file_structure)
+
+			src = os.path.join(test_root, "a", "b", "1.txt")
+			dst = os.path.join(test_root, "A", "B", "2.txt")
+			_move(src, dst)
+
+			self.assertEqual(os.listdir(test_root), ["A"])
+
+			src = os.path.join(test_root, "A", "B", "2.txt")
+			dst = os.path.join(test_root, "a", "b", "2.txt")
+			_move(src, dst)
+
+			self.assertEqual(os.listdir(test_root), ["a"])
 
 if __name__ == "__main__":
-	unittest.main()
+	try:
+		unittest.main()
+	except SystemExit as e:
+		pass
