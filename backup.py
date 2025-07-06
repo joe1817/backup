@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Joe Walter
 
-# Terminology
-# "entry" = file or directory
+# Terms used:
+# "entry"    = file or directory
 # "basename" = filename without the extension
 
 import sys
@@ -42,20 +42,22 @@ class Results:
 	def err_count(self):
 		return self.create_error + self.rename_error + self.update_error + self.delete_error
 
-def backup(src_root, dst_root, *, trash_root=None, filter="+ **/*/ **/*", ignore_missing=False, rename_threshold=10000, metadata_only=False, dry_run=False, log_path="-", quiet=False, veryquiet=False):
+def backup(src_root, dst_root, *, trash_root=None, filter="+ **/*/ **/*", ignore_hidden=False, rename_threshold=10000, metadata_only=False, dry_run=False, log_path="-", quiet=False, veryquiet=False):
 	'''
 	Copies new and updated files from `src_root` to `dst_root`, and optionally "deletes" files from `dst_root` if they are not present in `src_root` (they will be moved into `trash_root`, preserving directory structure). Furthermore, files that exist in `dst_root` but renamed in `src_root` may be renamed in `dst_root` to match. Candidates for rename are discovered by searching for files with an identical metadata signature, consisting of file size and modification time. These candidates must be above a minimum size threshold (`rename_threshold`) and have an unambiguously unique metadata signature within their respective root directories. The user is asked to confirm these renames before they are committed.
 
 	Args
 		src_root (str)           : The root directory to copy files from.
 		dst_root (str)           : The root directory to copy files to.
-		trash_root (bool or str) : The root directory to place files that are "deleted" from `dst_root`. Must be on the same filesystem as `dst_root`. Files will not be "deleted" if this is `None`. (Defaults to `None`.)
-		filter (str)             : The filter to include/exclude files and directories. Include by prepending a space-separated list with "+", and exclude with "-". Included files will be copied, while included directories will be searched. Each Pattern ending with "/" will apply to directories only. Otherise the pattern will apply only to files. (Defaults to `+ **/*/ **/*`.)
-		ignore_missing (bool)    : Whether the relative paths indicated by `include` may point to non-existent files in `src_root`. (Defaults to `False`.)
+		trash_root (bool or str) : The root directory to move 'extra' files (those that are in `dst_root` but not `src_root`). Must be on the same filesystem as `dst_root`. If set to `True`, then a directory will automatically be made next to `dst_root`. Extra files will not be moved if this argument is `None`. (Defaults to `None`.)
+
+		filter (str)             : The filter to include/exclude files and directories. Include by prepending a space-separated list with "+", and exclude with "-". Included files will be copied, while included directories will be searched. Each Pattern ending with "/" will apply to directories only. Otherise the pattern will apply only to files. (Defaults to "+ **/*/ **/*".)
+		ignore_hidden (bool)     : Whether to skip hidden files by default. If `True`, then wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., "**/.*") will still match these entries. (Defaults to `False`.)
 		rename_threshold (int)   : The minimum size in bytes needed to consider renaming files in `dst_root` that were renamed in `src_root`. Renamed files below this threshold will be simply deleted in `dst_root` and their replacements created. A value of `None` will mean no files in `dst_root` will be eligible for renaming. (Defaults to `10000`.)
 		metadata_only (bool)     : Whether to use only metadata in determining which files in dst_root are the result of a rename. If set to False, `backup` will also compare the last 1kb of files. (Defaults to `False`.)
 		dry_run (bool)           : Whether to hold off performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console. (Defaults to `False`.)
-		log_path (str)           : File to write log messages to. A falsy value means no log will be created. A value of '-' means a tempfile will be used for the log, and it will be copied to the user's home directory after the backup is done. (Defaults to '-'.)
+
+		log_path (str)           : File to write log messages to. A falsy value means no log will be created. A value of "-" means a tempfile will be used for the log, and it will be copied to the user's home directory after the backup is done. (Defaults to "-".)
 		quiet (bool)             : Whether to forgo printing to stdout.
 		veryquiet (bool)         : Whether to forgo printing to stdout and stderr.
 
@@ -91,9 +93,8 @@ def backup(src_root, dst_root, *, trash_root=None, filter="+ **/*/ **/*", ignore
 		if not isinstance(filter, str):
 			msg = f"Bad type for arg 'filter' (expected str): {include}"
 			raise TypeError(msg)
-		if not isinstance(ignore_missing, bool):
-			msg = f"Bad type for arg 'ignore_missing' (expected bool): {ignore_missing}"
-			raise TypeError(msg)
+		if not isinstance(ignore_hidden, bool):
+			msg = f"Bad type for arg 'ignore_hidden' (expected bool): {ignore_hidden}"
 			raise TypeError(msg)
 		if rename_threshold is not None and not isinstance(rename_threshold, int):
 			msg = f"Bad type for arg 'rename_threshold' (expected int): {rename_threshold}"
@@ -134,8 +135,8 @@ def backup(src_root, dst_root, *, trash_root=None, filter="+ **/*/ **/*", ignore
 			msg = f"Chosen log already exists: {log_path}"
 			raise ValueError(msg)
 
-		src_files = _listdir(src_root, filter)
-		dst_files = _listdir(dst_root, filter)
+		src_files = _listdir(src_root, filter, ignore_hidden)
+		dst_files = _listdir(dst_root, filter, ignore_hidden)
 
 		if log_path == "-":
 			log_path = os.path.expanduser(os.path.join("~", f"py-backup.{timestamp}.log"))
@@ -143,7 +144,7 @@ def backup(src_root, dst_root, *, trash_root=None, filter="+ **/*/ **/*", ignore
 		elif log_path:
 			log_manager.log_path = log_path
 
-		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {timestamp=} {filter=} {ignore_missing=} {rename_threshold=} {dry_run=} {log_path=} {quiet=} {veryquiet=}")
+		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {timestamp=} {filter=} {ignore_hidden=} {rename_threshold=} {dry_run=} {log_path=} {quiet=} {veryquiet=}")
 
 		width = max(len(src_root), len(dst_root)) + 3
 		#logger.info("=" * width)
@@ -223,11 +224,11 @@ def backup(src_root, dst_root, *, trash_root=None, filter="+ **/*/ **/*", ignore
 		return results
 
 class Filter:
-	def __init__(self, s):
+	def __init__(self, filter_string, ignore_hidden):
 		self.patterns = []
 
-		s = s.strip()
-		for action, patterns in re.findall(r"(\+|-)\s+((?:(?:'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-])\s*)+)", s):
+		filter_string = filter_string.strip()
+		for action, patterns in re.findall(r"(\+|-)\s+((?:(?:'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-])\s*)+)", filter_string):
 			action = action == "+"
 			added_parent_dirs = set()
 			for pattern in re.findall(r"'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-]", patterns):
@@ -241,7 +242,7 @@ class Filter:
 				if os.path.isabs(pattern):
 					raise ValueError(f"Absolute paths are not supported as arguments to include/exclude: {path}")
 
-				regex = glob.translate(pattern, recursive=True, include_hidden=True)
+				regex = glob.translate(pattern, recursive=True, include_hidden=(not ignore_hidden))
 				reobj = re.compile(regex)
 				self.patterns.append((action, reobj))
 
@@ -265,7 +266,7 @@ class Filter:
 				return action
 		return False
 
-def _listdir(root, filter="+ **/*/ **/*"):
+def _listdir(root, *, filter="+ **/*/ **/*", ignore_hidden=False):
 	'''
 	Retrieves file relative paths, sizes, and mtimes for files inside a directory. (All "relative paths" are relative to `root`.)
 
@@ -276,7 +277,7 @@ def _listdir(root, filter="+ **/*/ **/*"):
 	Returns
 		A SimpleNamespace containing two fields: `relpath_stats` and `empty_dirs`. `relpath_stats` is a `dict` with keys being each file's relative path and values being a `namedtuple` of file size (`size`) and modtime (`mtime`). `empty_dirs` is a set of relative paths to empty directories.
 	'''
-	f = Filter(filter)
+	f = Filter(filter, ignore_hidden)
 
 	Metadata = namedtuple("Metadata", ["size", "mtime"])
 
@@ -619,14 +620,16 @@ class _ConsoleHandler(logging.Handler):
 class _ArgParser:
 	parser = argparse.ArgumentParser(
 		description="Copy new and updated files from one directory to another, update renamed files' names to match where possible, and optionally delete non-matching files.",
-		epilog="(c) 2025 Joe Walter")
+		epilog="(c) 2025 Joe Walter"
+	)
 
 	parser.add_argument("src_root", help="The root directory to copy files from.")
 	parser.add_argument("dst_root", help="The root directory to copy files to.")
+	parser.add_argument("-t", "--trash-root", metavar="path", nargs="?", default=None, const=True, help="The root directory to move 'extra' files (those that are in `dst_root` but not `src_root`). Must be on the same filesystem as `dst_root`. If included without an argument, then a directory will automatically be made next to `dst_root`. Extra files will not be moved if this option is omitted.")
 
-	parser.add_argument("-f", "--filter", metavar="filter", nargs=1, default="+ **/*/ **/*", help="The filter to include/exclude files and directories. Include entries by preceding a space-separated list with \"+\", and exclude with \"-\". Included files will be copied, while included directories will be searched. Each pattern ending with a slash will only apply to directories. Otherise the pattern will only apply to files. (Defaults to `+ **/*/ **/*`.)")
-	parser.add_argument("-t", "--trash-root", metavar="path", nargs="?", default=None, const=True, help="The root directory to move files that exist in dst_root but not src_root. Must be on the same filesystem as dst_root. Files will not be moved if this option is omitted.")
-	parser.add_argument("-r", "--rename-threshold", metavar="size", nargs=1, type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root that were renamed in src_root. Renamed files below this threshold will be simply deleted in dst_root and their replacements created.")
+	parser.add_argument("-f", "--filter", metavar="filter_string", nargs=1, default="+ **/*/ **/*", help="The filter to include/exclude files and directories. Include entries by preceding a space-separated list with \"+\", and exclude with \"-\". Included files will be copied, while included directories will be searched. Each pattern ending with a slash will only apply to directories. Otherise the pattern will only apply to files. (Defaults to \"+ **/*/ **/*\".)")
+	parser.add_argument("--ignore-hidden", action="store_true", default=False, help="Whether to skip hidden files by default. If `True`, then wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., \"**/.*\") will still match these entries. (Defaults to `False`.)")
+	parser.add_argument("-r", "--rename-threshold", metavar="size", nargs=1, type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root to match those in src_root. Renamed files below this threshold will be simply deleted in dst_root and their replacements copied over.")
 	parser.add_argument("-m", "--metadata_only", action="store_true", default=False, help="Use only metadata in determining which files in dst_root are the result of a rename. Otherwise, backup will also compare the last 1kb of files.")
 	parser.add_argument("--dry-run", action="store_true", default=False, help="Forgo performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console.")
 
@@ -659,6 +662,7 @@ def backup2(args):
 		args.dst_root,
 		trash_root       = args.trash_root,
 		filter           = args.filter,
+		ignore_hidden    = args.ignore_hidden,
 		rename_threshold = args.rename_threshold,
 		metadata_only    = args.metadata_only,
 		dry_run          = args.dry_run,
@@ -670,11 +674,11 @@ def backup2(args):
 def main():
 	'''
 	Return Codes:
-	0 = Finished OK
-	1 = Unknown error
-	2 = Bad input
-	3 = Finished with OSErrors
-	130 = Cancelled by user
+		0 = Finished OK
+		1 = Unknown error
+		2 = Bad input
+		3 = Finished with OSErrors
+		130 = Cancelled by user
 	'''
 	try:
 		results = backup2(sys.argv[1:])
