@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from backup import backup, backup2, Results, _listdir, _operations, _move
+from backup import backup, backup2, Results, _Filter, _listdir, _operations, _move
 
 def hash_directory(root, ignore_empty_dirs=False):
 	hasher = hashlib.sha256()
@@ -43,6 +43,64 @@ def create_file_structure(root_dir : Path, structure : dict):
             filepath.write_text(content)
 
 class TestBackup(unittest.TestCase):
+	def test_filter(self):
+		f = _Filter("- **/.git/ **/__pycache__/ + **/*/ **/*")
+		self.assertTrue(f.filter("a"))
+		self.assertTrue(f.filter("a/b"))
+		self.assertTrue(f.filter("a/b/c"))
+		self.assertFalse(f.filter(".git/"))
+		self.assertFalse(f.filter("a/.git/"))
+		self.assertFalse(f.filter("a/b/.git/"))
+		self.assertFalse(f.filter("__pycache__/"))
+		self.assertFalse(f.filter("a/__pycache__/"))
+		self.assertFalse(f.filter("a/b/__pycache__/"))
+
+		f = _Filter("+ places.sqlite key4.db logins.json cookies.sqlite prefs.js - **/*/ **/*")
+		self.assertTrue(f.filter("places.sqlite"))
+		self.assertTrue(f.filter("key4.db"))
+		self.assertTrue(f.filter("logins.json"))
+		self.assertTrue(f.filter("cookies.sqlite"))
+		self.assertTrue(f.filter("prefs.js"))
+		self.assertFalse(f.filter("storage.sqlite"))
+		self.assertFalse(f.filter("storage/"))
+
+		f = _Filter("+ audio/music/**/*.flac - **/*/ **/*")
+		self.assertTrue(f.filter("audio/"))
+		self.assertTrue(f.filter("audio/music/"))
+		self.assertTrue(f.filter("audio/music/OST/"))
+		self.assertTrue(f.filter("audio/music/OST/Star Wars/"))
+		self.assertTrue(f.filter("audio/music/OST/Star Wars/Duel of the Fates.flac"))
+		self.assertFalse(f.filter("video/"))
+		self.assertFalse(f.filter("audio/audiobooks/"))
+		self.assertFalse(f.filter("audio/music/OST/Star Wars/cover.jpg"))
+
+		f = _Filter("- audio/music/**/*.wav + **/*/ **/*")
+		self.assertTrue(f.filter("audio/"))
+		self.assertTrue(f.filter("audio/music/"))
+		self.assertTrue(f.filter("audio/music/OST/"))
+		self.assertTrue(f.filter("audio/music/OST/Titanic/"))
+		self.assertFalse(f.filter("audio/music/OST/Titanic/My Heart Will Go On (Recorder Cover).wav"))
+		self.assertTrue(f.filter("video/"))
+		self.assertTrue(f.filter("audio/audiobooks/"))
+		self.assertTrue(f.filter("audio/music/OST/Titanic/cover.jpg"))
+
+		f = _Filter("- ./**/foo/bar/ '**/eggs and spam/' \"Joe's Files/\" + **/*/ **/*")
+		self.assertFalse(f.filter("foo/bar/"))
+		self.assertFalse(f.filter("eggs and spam/"))
+		self.assertFalse(f.filter("Joe's Files/"))
+
+		f = _Filter("+ * - a/ b/a/ + b/*/ - **/x + ?/**/* - **/*")
+		self.assertTrue(f.filter("a"))
+		self.assertTrue(f.filter("b/a"))
+		self.assertTrue(f.filter("b/a/a"))
+		self.assertTrue(f.filter("b/b/"))
+		self.assertFalse(f.filter("a/"))
+		self.assertFalse(f.filter("b/a/"))
+		self.assertFalse(f.filter("b/b/x"))
+		self.assertTrue(f.filter("b/y"))
+		self.assertTrue(f.filter("b/b/y"))
+		self.assertFalse(f.filter("aa/y"))
+
 	def test_listdir(self):
 		with tempfile.TemporaryDirectory(suffix=None, prefix=None, dir=None) as temp_root:
 			test_root = Path(temp_root)
@@ -146,7 +204,6 @@ class TestBackup(unittest.TestCase):
 
 	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-	'''
 	def test_operations(self):
 		with tempfile.TemporaryDirectory(suffix=None, prefix=None, dir=None) as temp_root:
 			test_root = Path(temp_root)
@@ -175,12 +232,25 @@ class TestBackup(unittest.TestCase):
 			dst_files = _listdir(
 				root = dst_root
 			)
-			trash_dir = None
-			rename_threshold = 0
-			metadata_only = False
+			trash_dir = "/"
+			rename_threshold = 1000
+			metadata_only = True
 
-			print(list(_operations(src_files, dst_files, src_root, dst_root, trash_dir, rename_threshold, metadata_only)))
-	'''
+			actual = list(x[4] for x in _operations(
+				src_files        = src_files,
+				dst_files        = dst_files,
+				src_root         = src_root,
+				dst_root         = dst_root,
+				trash_dir        = trash_dir,
+				rename_threshold = rename_threshold,
+				metadata_only    = metadata_only
+			))
+			expected = [
+				f"- {os.path.join('A','1.txt')}",
+				f"+ {os.path.join('a','1.txt')}",
+				f"- {os.path.join('empty','empty2') + os.sep}"
+			]
+			self.assertTrue(actual == expected)
 
 	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -204,6 +274,12 @@ class TestBackup(unittest.TestCase):
 
 			src = os.path.join(test_root, "A", "B", "2.txt")
 			dst = os.path.join(test_root, "a", "b", "2.txt")
+			_move(src, dst)
+
+			self.assertEqual(os.listdir(test_root), ["a"])
+
+			src = os.path.join(test_root, "a", "b", "2.txt")
+			dst = os.path.join(test_root, "a", "B", "2.txt")
 			_move(src, dst)
 
 			self.assertEqual(os.listdir(test_root), ["a"])
