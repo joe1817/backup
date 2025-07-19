@@ -270,23 +270,27 @@ def backup(
 class _Filter:
 	def __init__(self, filter_string:str, *, ignore_hidden:bool = False):
 		self.patterns = []
+		implicit_dirs = set()
 
 		filter_string = filter_string.strip()
 		for action, patterns in re.findall(r"(\+|-)\s+((?:(?:'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-])\s*)+)", filter_string):
 			action = action == "+"
-			added_parent_dirs = set()
+			if not action:
+				# clear if - action
+				implicit_dirs = set()
 			for pattern in re.findall(r"'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-]", patterns):
 				if pattern[0] == "'" or pattern[0] == "\"":
 					pattern = pattern[1:-1]
-				if pattern[:2] == "./":
+				if pattern[:2] == ".\\" or pattern[:2] == "./":
 					pattern = pattern[2:]
-				#if pattern == "**":
-				#	pattern = "**/*"
 
-				if pattern == ".." or pattern.startswith(f"..{os.sep}") or f"{os.sep}..{os.sep}" in pattern or pattern.endswith(f"{os.sep}.."):
+				if pattern == ".." or re.search("^\\\\.\\.[\\\\/]", pattern) or re.search("[\\\\/]\\.\\.[\\\\/]", pattern) or re.search("[\\\\/]\\.\\.$", pattern):
 					raise ValueError(f"Parent directories ('..') are not supported in pattern arguments to include/exclude: {pattern}")
 				if os.path.isabs(pattern):
 					raise ValueError(f"Absolute paths are not supported as arguments to include/exclude: {pattern}")
+
+				if pattern == "":
+					continue
 
 				regex = glob.translate(pattern, recursive=True, include_hidden=(not ignore_hidden))
 				reobj = re.compile(regex)
@@ -298,17 +302,16 @@ class _Filter:
 						pattern = os.path.dirname(pattern)
 						if pattern == "":
 							break
-						if pattern in added_parent_dirs:
+						if pattern in implicit_dirs:
 							break
-						added_parent_dirs.add(pattern)
-						regex = glob.translate(pattern + os.sep, recursive=True, include_hidden=True)
+						implicit_dirs.add(pattern)
+						regex = glob.translate(pattern + "/", recursive=True, include_hidden=(not ignore_hidden))
 						reobj = re.compile(regex)
 						self.patterns.append((action, reobj))
 
 	def filter(self, relpath:str, default:bool = False):
 		for action, reobj in self.patterns:
 			if reobj.match(relpath):
-				#print(f"{action=} {pattern=} {relpath=}")
 				return action
 		return default
 
