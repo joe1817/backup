@@ -59,27 +59,29 @@ def backup(
 		metadata_only    : bool = False,
 		dry_run          : bool = False,
 		log              : str | os.PathLike[str] | None = None,
+		debug            : bool = False,
 		quiet            : bool = False,
-		veryquiet        : bool = False
+		veryquiet        : bool = False,
 	) -> Results:
 	'''
 	Copies new and updated files from `src` to `dst`, and optionally "deletes" files from `dst` if they are not present in `src` (they will be moved into `trash`, preserving directory structure). Furthermore, files that exist in `dst` but as a different name in `src` may be renamed in `dst` to match. Candidates for rename are discovered by searching for files with an identical metadata signature, consisting of file size and modification time. These candidates must be above a minimum size threshold (`rename_threshold`) and have an unambiguously unique metadata signature within their respective root directories. The user is asked to confirm these renames before they are committed.
 
 	Args
-		src (str or PathLike)      : The root directory to copy files from.
-		dst (str or PathLike)      : The root directory to copy files to.
-		trash (str or PathLike)    : The root directory to move 'extra' files (those that are in `dst` but not `src`). Must be on the same filesystem as `dst`. If set to "auto", then a directory will automatically be made next to `dst`. Extra files will not be moved if this argument is `None`. (Defaults to `None`.)
+		src (str or PathLike)    : The root directory to copy files from. Can be a symlink to a directory.
+		dst (str or PathLike)    : The root directory to copy files to. Can be a symlink to a directory.
+		trash (str or PathLike)  : The root directory to move 'extra' files (those that are in `dst` but not `src`). Must be on the same filesystem as `dst`. If set to "auto", then a directory will automatically be made next to `dst`. Extra files will not be moved if this argument is `None`. (Defaults to `None`.)
 
-		filter (str)               : The filter to include/exclude files and directories. Similar to rsync, the format of the filter string is: (+ or -), followed by a list of one of more relative path patterns, and otionally repeat from the start. Including (+) or excluding (-) of entries is determined by the preceding symbol of the first matching pattern. Included files will be copied, while included directories will be searched. Each Pattern ending with "/" will apply to directories only. Otherise the pattern will apply only to files. (Defaults to "+ **/*/ **/*", which searches all directories and copies all files.)
-		ignore_hidden (bool)       : Whether to skip hidden files by default. If `True`, then wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., "**/.*") will still match these entries. (Defaults to `False`.)
-		follow_symlinks (bool)     : Whether to follow symbolic links under `src` and `dst`. Note that `src` and `dst` themselves will be followed if either is a symlink. (Defaults to `False`.)
-		rename_threshold (int)     : The minimum size in bytes needed to consider renaming files in `dst` that were renamed in `src`. Renamed files below this threshold will be simply deleted in `dst` and their replacements created. A value of `None` will mean no files in `dst` will be eligible for renaming. (Defaults to `10000`.)
-		metadata_only (bool)       : Whether to use only metadata in determining which files in dst are the result of a rename. If set to False, `backup` will also compare the last 1kb of files. (Defaults to `False`.)
-		dry_run (bool)             : Whether to hold off performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console. (Defaults to `False`.)
+		filter (str)             : The filter to include/exclude files and directories. Similar to rsync, the format of the filter string is: (+ or -), followed by a list of one of more relative path patterns, and otionally repeat from the start. Including (+) or excluding (-) of entries is determined by the preceding symbol of the first matching pattern. Included files will be copied, while included directories will be searched. Each Pattern ending with "/" will apply to directories only. Otherise the pattern will apply only to files. (Defaults to "+ **/*/ **/*", which searches all directories and copies all files.)
+		ignore_hidden (bool)     : Whether to skip hidden files by default. If `True`, then wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., "**/.*") will still match these entries. (Defaults to `False`.)
+		follow_symlinks (bool)   : Whether to follow symbolic links under `src` and `dst`. Note that `src` and `dst` themselves will be followed regardless of this argument. (Defaults to `False`.)
+		rename_threshold (int)   : The minimum size in bytes needed to consider renaming files in `dst` that were renamed in `src`. Renamed files below this threshold will be simply deleted in `dst` and their replacements created. A value of `None` will mean no files in `dst` will be eligible for renaming. (Defaults to `10000`.)
+		metadata_only (bool)     : Whether to use only metadata in determining which files in dst are the result of a rename. If set to False, `backup` will also compare the last 1kb of files. (Defaults to `False`.)
+		dry_run (bool)           : Whether to hold off performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console. (Defaults to `False`.)
 
-		log (str or PathLike) : File to write log messages to. A value of "auto" means a tempfile will be used for the log, and it will be copied to the user's home directory after the backup is done. A value of `None` will skip logging. (Defaults to `None`.)
-		quiet (bool)               : Whether to forgo printing to stdout.
-		veryquiet (bool)           : Whether to forgo printing to stdout and stderr.
+		log (str or PathLike)    : File to write log messages to. A value of "auto" means a tempfile will be used for the log, and it will be copied to the user's home directory after the backup is done. A value of `None` will skip logging. (Defaults to `None`.)
+		debug (bool)             : Whether to log debug messages. (Default to `False`.)
+		quiet (bool)             : Whether to forgo printing to stdout.
+		veryquiet (bool)         : Whether to forgo printing to stdout and stderr.
 
 	Console Output
 		TODO
@@ -94,7 +96,8 @@ def backup(
 	if dry_run and log == "auto":
 		log = None
 
-	with _LogManager(suppress_stdout=quiet, suppress_stderr=veryquiet) as log_manager:
+	with _LogManager(debug=debug, suppress_stdout=quiet, suppress_stderr=veryquiet) as log_manager:
+		assert log_manager is not None
 
 		if not isinstance(src, (str, os.PathLike)):
 			msg = f"Bad type for arg 'src' (expected str or PathLike): {src}"
@@ -139,7 +142,7 @@ def backup(
 		elif trash == "auto":
 			trash_root = Path(dst_root).parent / f"Trash.{timestamp}"
 		else:
-			trash_root = Path(trash).parent / timestamp
+			trash_root = Path(trash) / timestamp
 		results.trash_root = trash_root
 
 		if log is None:
@@ -176,19 +179,19 @@ def backup(
 			msg = f"rename_threshold must be non-negative: {rename_threshold}"
 			raise ValueError(msg)
 
-		src_files = _FileList(src_root, filter=filter, ignore_hidden=ignore_hidden, follow_symlinks=follow_symlinks)
-		dst_files = _FileList(dst_root, filter=filter, ignore_hidden=ignore_hidden, follow_symlinks=follow_symlinks)
-
 		if log_file is not None:
 			log_manager.log_file = log_file
 
-		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {filter=} {ignore_hidden=} {rename_threshold=} {dry_run=} {log_file=} {quiet=} {veryquiet=}")
+		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {filter=} {ignore_hidden=} {follow_symlinks=} {rename_threshold=} {dry_run=} {log_file=} {debug=} {quiet=} {veryquiet=}")
 
 		width = max(len(str(src_root)), len(str(dst_root))) + 3
 		#logger.info("=" * width)
 		logger.info("   " + str(src_root))
 		logger.info("-> " + str(dst_root))
 		logger.info("-" * width)
+
+		src_files = _FileList(src_root, filter=filter, ignore_hidden=ignore_hidden, follow_symlinks=follow_symlinks)
+		dst_files = _FileList(dst_root, filter=filter, ignore_hidden=ignore_hidden, follow_symlinks=follow_symlinks)
 
 		for op, src_file, dst_file, byte_diff, summary in _operations(
 			src_files,
@@ -244,7 +247,6 @@ def backup(
 				else:
 					assert False
 
-
 		if dry_run:
 			logger.info("")
 			logger.info("*** DRY RUN ***")
@@ -257,20 +259,12 @@ def backup(
 			logger.info(f"Delete Success: {results.delete_success}" + (f" / Failed: {results.delete_error}" if results.delete_error else ""))
 			logger.info(f"Net Change: {_human_readable_size(results.byte_diff)}")
 
-		if results.err_count:
-			logger.info("")
-			logger.info(f"Finished with {results.err_count} errors.")
-			logger.info(f"See the log at {log_file} for details.")
-		else:
-			logger.info("")
-			logger.info("Finished successfully.")
-
 		return results
 
 class _Filter:
 	def __init__(self, filter_string:str, *, ignore_hidden:bool = False):
 		self.patterns = []
-		implicit_dirs = set()
+		implicit_dirs : set[str] = set()
 
 		filter_string = filter_string.strip()
 		for action, patterns in re.findall(r"(\+|-)\s+((?:(?:'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-])\s*)+)", filter_string):
@@ -414,15 +408,16 @@ def _operations(
 		src_only_relpath_from_stats = _reverse_dict({path:src_relpath_stats[path] for path in src_only_relpaths})
 		dst_only_relpath_from_stats = _reverse_dict({path:dst_relpath_stats[path] for path in dst_only_relpaths})
 
-		for dst_relpath in dst_only_relpaths:
+		for dst_relpath in list(dst_only_relpaths): # dst_only_relpaths is changed inside the loop
 			# Ignore small files
-			if dst_relpath_stats[dst_relpath][0] < rename_threshold:
+			if dst_relpath_stats[dst_relpath].size < rename_threshold:
 				continue
 			try:
 				rename_to = src_only_relpath_from_stats[dst_relpath_stats[dst_relpath]]
 				# Ignore if there are multiple candidates
 				if rename_to is None:
 					continue
+
 				rename_from = dst_only_relpath_from_stats[dst_relpath_stats[dst_relpath]]
 				# Ignore if there are multiple candidates
 				if rename_from is None:
@@ -439,7 +434,7 @@ def _operations(
 				dst_only_relpaths.remove(rename_from)
 
 				rename_from = dst_files.real_names[rename_from]
-				rename_to = dst_files.real_names[rename_to]
+				rename_to = src_files.real_names[rename_to]
 
 				src = dst_files.root / rename_from
 				dst = dst_files.root / rename_to
@@ -571,7 +566,7 @@ def _move(src:Path, dst:Path, *, exist_ok:bool = False, delete_empty_dirs_under:
 
 	# move the file
 	dir = dst.parent
-	dir.mkdir(exist_ok=True)
+	dir.mkdir(exist_ok=True, parents=True)
 	src.rename(dst)
 
 	# delete empty directories left after the move
@@ -629,18 +624,22 @@ def _human_readable_size(num_bytes:int) -> str:
 class _LogManager:
 	'''ContextManager that handles creation the log file and records whether to suppress stdout.'''
 
-	def __init__(self ,*, suppress_stdout:bool = False, suppress_stderr:bool = False):
+	def __init__(self ,*, debug:bool=False, suppress_stdout:bool = False, suppress_stderr:bool = False):
 		self._log_file           : Path | None = None # the working copy of the log file
 		self.final_log_file      : Path | None = None # where to move the working copy upon completion
 		self.log_handler_file    : logging.FileHandler | None = None
 
+		self.debug               : bool = debug
 		self.suppress_stdout     : bool = suppress_stdout
 		self.suppress_stderr     : bool = suppress_stderr
 		self.log_handler_console = _ConsoleHandler(self)
 
 		formatter = logging.Formatter("%(message)s")
 		self.log_handler_console.setFormatter(formatter)
-		self.log_handler_console.setLevel(logging.INFO)
+		if self.debug:
+			self.log_handler_console.setLevel(logging.DEBUG)
+		else:
+			self.log_handler_console.setLevel(logging.INFO)
 		logger.addHandler(self.log_handler_console)
 
 	@property
@@ -657,7 +656,10 @@ class _LogManager:
 			formatter = logging.Formatter("%(levelname)s: %(message)s")
 			self.log_handler_file = logging.FileHandler(self.log_file, encoding="utf-8")
 			self.log_handler_file.setFormatter(formatter)
-			self.log_handler_file.setLevel(logging.DEBUG)
+			if self.debug:
+				self.log_handler_file.setLevel(logging.DEBUG)
+			else:
+				self.log_handler_file.setLevel(logging.INFO)
 			logger.addHandler(self.log_handler_file)
 			self.log_handler_console.log_file = path
 		elif self.log_handler_file is not None:
@@ -670,19 +672,20 @@ class _LogManager:
 			self.log_handler_file = None
 			self.log_handler_console.log_file = None
 
-
 	def __enter__(self):
-		pass
+		return self
 
 	def __exit__(self, exc_type, exc_value, tb) -> None:
 		if exc_type:
 			if exc_type is TypeError or exc_type is ValueError:
 				logger.critical(f"Input Error: {exc_value}")
 			elif exc_type is KeyboardInterrupt:
-				logger.warning(f"Cancelled by user.")
+				logger.critical(f"Cancelled by user.")
 			else:
 				logger.critical(f"{exc_type.__name__}: {exc_value}")
 				logger.debug(traceback.format_exc())
+		else:
+			logger.info("Finished successfully.")
 
 		if self.log_handler_file is not None:
 			assert self.final_log_file is not None
@@ -727,11 +730,12 @@ class _ConsoleHandler(logging.Handler):
 		if not self.log_manager.suppress_stdout:
 			if self.log_file is not None:
 				sys.stdout.write(f"This output is saved at {self.log_file}.\n")
-			sys.stdout.write(f"There were {self.count_errs} errors.\n")
-			if 0 < len(self.errs) <= self.max_err_recap and not self.critical_err:
-				sys.stdout.write("Errors are reprinted below for convenience:\n")
-				for err in self.errs:
-					sys.stdout.write(err)
+			if not self.critical_err:
+				sys.stdout.write(f"There were {self.count_errs} errors.\n")
+				if 0 < len(self.errs) <= self.max_err_recap:
+					sys.stdout.write("Errors are reprinted below for convenience:\n")
+					for err in self.errs:
+						sys.stdout.write(err)
 
 class _ArgParser:
 	'''Argument parser for when this python file is run with arguments instead of an imported module.'''
@@ -746,13 +750,14 @@ class _ArgParser:
 	parser.add_argument("-t", "--trash-root", metavar="path", nargs="?", type=str, default=None, const="auto", help="The root directory to move 'extra' files (those that are in `dst_root` but not `src_root`). Must be on the same filesystem as `dst_root`. If set to \"auto\", then a directory will automatically be made next to `dst_root`. Extra files will not be moved if this option is omitted.")
 
 	parser.add_argument("-f", "--filter", metavar="filter_string", nargs=1, type=str, default="+ **/*/ **/*", help="The filter to include/exclude files and directories. Similar to rsync, the format of the filter string is: (+ or -), followed by a list of one of more relative path patterns, and otionally repeat from the start. Including (+) or excluding (-) of entries is determined by the preceding symbol of the first matching pattern. Included files will be copied, while included directories will be searched. Each Pattern ending with \"/\" will apply to directories only. Otherise the pattern will apply only to files. (Defaults to \"+ **/*/ **/*\", which searches all directories and copies all files.)")
-	parser.add_argument("--ignore-hidden", action="store_true", default=False, help="Whether to skip hidden files by default. If `True`, then wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., \"**/.*\") will still match these entries. (Defaults to `False`.)")
-	parser.add_argument("-r", "--rename-threshold", metavar="size", nargs=1, type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root to match those in src_root. Renamed files below this threshold will be simply deleted in dst_root and their replacements copied over.")
-	parser.add_argument("-m", "--metadata_only", action="store_true", default=False, help="Use only metadata in determining which files in dst_root are the result of a rename. Otherwise, backup will also compare the last 1kb of files.")
+	parser.add_argument("--ignore-hidden", action="store_true", default=False, help="Skip hidden files by default. That is, wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., \"**/.*\") will still match these entries.")
+	parser.add_argument("-L", "--follow-symlinks", action="store_true", default=False, help="Whether to follow symbolic links under `src_root` and `dst_root`. Note that `src_root` and `dst_root` themselves will be followed regardless of this argument.")
+	parser.add_argument("-r", "--rename-threshold", metavar="size", nargs=1, type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root to match those in `src_root`. Renamed files below this threshold will be simply deleted in dst_root and their replacements copied over.")
+	parser.add_argument("-m", "--metadata_only", action="store_true", default=False, help="Use only metadata in determining which files in `dst_root` are the result of a rename. Otherwise, backup will also compare the last 1kb of files.")
 	parser.add_argument("--dry-run", action="store_true", default=False, help="Forgo performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console.")
 
 	parser.add_argument("--log", metavar="path", nargs="?", type=str, default=None, const="auto", help="File to write log messages to. If set to \"auto\", then a tempfile will be used for the log, and it will be moved to the user's home directory after the backup is done. If absent, then no logging will be performed.")
-
+	parser.add_argument("-d", "--debug", action="store_true", default=False, help="Log debug messages.")
 	parser.add_argument("-q", action="count", default=0, help="Forgo printing to stdout (-q) and stderr (-qq).")
 
 	@staticmethod
@@ -777,6 +782,7 @@ def backup2(args:list[str]) -> Results:
 		metadata_only    = parsed_args.metadata_only,
 		dry_run          = parsed_args.dry_run,
 		log              = parsed_args.log,
+		debug            = parsed_args.debug,
 		quiet            = parsed_args.quiet,
 		veryquiet        = parsed_args.veryquiet
 	)
@@ -787,11 +793,6 @@ def main() -> None:
 	except SystemExit:
 		# from argparse
 		pass
-	except (TypeError, ValueError) as e:
-		print(e)
-	except KeyboardInterrupt:
-		print()
-		print("KeyboardInterrupt")
 	except Exception:
 		print()
 		traceback.print_exc()
