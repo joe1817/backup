@@ -45,7 +45,7 @@ def hash_directory(root:Path, *, follow_links:bool=False, ignore_empty_dirs:bool
 		print("--- Hash End ---")
 	return hasher.hexdigest()
 
-def create_file_structure(root_dir:Path, structure:dict, *, _delay:float = 0.001):
+def create_file_structure(root_dir:Path, structure:dict, *, _delay:float = 0.01):
 	'''Recursively creates a directory structure with files.'''
 	root_dir.mkdir(parents=True, exist_ok=True)
 	for name, content in structure.items():
@@ -68,7 +68,7 @@ def create_file_structure(root_dir:Path, structure:dict, *, _delay:float = 0.001
 			# Create a file with content
 			file_path.write_text(content)
 	if _delay:
-		# delay so filesystem cache can update (changes to modtimes)
+		# delay so filesystem cache can update (changes to modtimes), TODO not sure if this actually works
 		time.sleep(_delay)
 
 def load_tests(loader, tests, ignore):
@@ -304,12 +304,19 @@ class TestBackup(unittest.TestCase):
 				a_files,
 				b_files,
 				trash_root	     = Path("/"),
-				rename_threshold = 1000,
+				rename_threshold = 0,
 				metadata_only	 = True
 			))
-			expected = [
-				f"- {os.path.join('empty','empty2') + os.sep}"
-			]
+
+			if "nt" in os.name:
+				expected = [
+					f"- {os.path.join('empty','empty2') + os.sep}"
+				]
+			else:
+				expected = [
+					f"R {os.path.join('a','1.txt')} -> {os.path.join('A','1.txt')}"
+					f"- {os.path.join('empty','empty2') + os.sep}"
+				]
 			self.assertEqual(actual, expected)
 
 			################################################################################
@@ -391,8 +398,8 @@ class TestBackup(unittest.TestCase):
 			dst = test_root / "dst"
 			hash_src_old = hash_directory(src)
 			hash_dst_old = hash_directory(dst)
-			
-			# test dry_run 
+
+			# test dry_run
 			self.assertFalse(hash_src_old == hash_dst_old)
 			results = backup.backup(
 				src,
@@ -402,13 +409,14 @@ class TestBackup(unittest.TestCase):
 				dry_run = True,
 			)
 			self.assertEqual(hash_directory(dst), hash_dst_old)
-			
+
 			# test basic backup
 			results = backup.backup(
 				src,
 				dst,
 				trash = "auto",
 				quiet = True,
+				log = "auto"
 			)
 			self.assertFalse(hash_directory(dst) == hash_dst_old)
 			self.assertEqual(hash_directory(src), hash_directory(dst))
@@ -416,8 +424,8 @@ class TestBackup(unittest.TestCase):
 				self.assertEqual(hash_directory(results.trash_root), hash_directory(test_root / "windows_expected_trash"))
 			else:
 				self.assertEqual(hash_directory(results.trash_root), hash_directory(test_root / "linux_expected_trash"))
-			
-			# test backup with symlink src			
+
+			# test backup with symlink src
 			file_structure = {
 				"src2" : test_root / "src",
 				"dst2" : {}
