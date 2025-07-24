@@ -148,7 +148,7 @@ class Results:
 
 	@property
 	def err_count(self) -> int:
-		return self.create_error + self.rename_error + self.update_error + self.delete_error + self.dir_create_success + self.dir_create_error + self.dir_delete_success + self.dir_delete_error
+		return self.create_error + self.rename_error + self.update_error + self.delete_error + self.dir_create_error + self.dir_delete_error
 
 def backup2(args:list[str]) -> Results:
 	'''Run backup with command line arguments.'''
@@ -212,6 +212,7 @@ def backup(
 		A `Results` object containing various statistics.
 	'''
 	results = Results()
+	critical_err = False
 
 	if veryquiet:
 		quiet = True
@@ -362,9 +363,9 @@ def backup(
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.delete_error += 1
-						err = str(e)
-						logger.error(err)
-						results.errors.append(err)
+						msg = error_summary(e)
+						logger.error(msg)
+						results.errors.append(msg)
 				elif op == "+":
 					try:
 						_copy(src_file, dst_file)
@@ -372,9 +373,9 @@ def backup(
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.create_error += 1
-						err = str(e)
-						logger.error(err)
-						results.errors.append(err)
+						msg = error_summary(e)
+						logger.error(msg)
+						results.errors.append(msg)
 				elif op == "U":
 					try:
 						_copy(src_file, dst_file)
@@ -382,48 +383,58 @@ def backup(
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.update_error += 1
-						err = str(e)
-						logger.error(err)
-						results.errors.append(err)
+						msg = error_summary(e)
+						logger.error(msg)
+						results.errors.append(msg)
 				elif op == "R":
 					try:
 						_move(src_file, dst_file, delete_empty_dirs_under=dst_root)
 						results.rename_success += 1
 					except OSError as e:
 						results.rename_error += 1
-						err = str(e)
-						logger.error(err)
-						results.errors.append(err)
+						msg = error_summary(e)
+						logger.error(msg)
+						results.errors.append(msg)
 				elif op == "D+":
 					try:
 						os.makedirs(dst_file, exist_ok=True)
 						results.dir_create_success += 1
 					except OSError as e:
 						results.dir_create_error += 1
-						err = str(e)
-						logger.error(err)
-						results.errors.append(err)
+						msg = error_summary(e)
+						logger.error(msg)
+						results.errors.append(msg)
 				elif op == "D-":
 					try:
 						_delete_empty_dirs(src_file, root=dst_root)
 						results.dir_delete_success += 1
 					except OSError as e:
 						results.dir_delete_error += 1
-						err = str(e)
-						logger.error(err)
-						results.errors.append(err)
+						msg = error_summary(e)
+						logger.error(msg)
+						results.errors.append(msg)
 				else:
 					assert False
 
 	except KeyboardInterrupt:
 		logger.critical(f"Cancelled by user.")
+		critical_err = True
 	except (TypeError, ValueError) as e:
 		logger.critical(f"Input Error: {e}")
+		critical_err = True
 	except Exception as e:
-		logger.critical(str(e))
-		logger.debug(traceback.format_exc())
+		logger.critical(error_summary(e))
+		logger.error(traceback.format_exc())
+		critical_err = True
 
 	finally:
+		if critical_err:
+			logger.info("")
+			logger.info("*** The program ended unexpectedly. ***")
+		else:
+			logger.info("")
+			logger.info("The program ended successfully.")
+
 		if dry_run:
 			logger.info("")
 			logger.info("*** DRY RUN ***")
@@ -559,6 +570,14 @@ def _operations(
 	dst_only_relpaths = sorted(dst_relpaths.difference(src_relpaths))
 	both_relpaths     = sorted(src_relpaths.intersection(dst_relpaths))
 
+	# Delete empty dirs now in case any new files needs to take their places
+	dst_only_empty_dirs = dst_files.empty_dirs.difference(src_files.empty_dirs)#.difference(src_files.empty_dirs)
+	for relpath in dst_only_empty_dirs:
+		dst_relpath_real = dst_files.real_names[relpath]
+		src = dst_files.root / dst_relpath_real
+		assert not any(src.iterdir())
+		yield ("D-", src, None, 0, f"- {dst_relpath_real}{os.sep}")
+
 	if rename_threshold is not None:
 		src_only_relpath_from_stats = _reverse_dict({path:src_relpath_stats[path] for path in src_only_relpaths})
 		dst_only_relpath_from_stats = _reverse_dict({path:dst_relpath_stats[path] for path in dst_only_relpaths})
@@ -594,7 +613,7 @@ def _operations(
 				src = dst_files.root / rename_from
 				dst = dst_files.root / rename_to
 
-				yield ("R", src, dst, 0, f"R {rename_from} -> {rename_to}")
+				yield ("R", src, dst, 0, f"R {rename_from} -> {rename_to}") ####################################### TODO what if dst exists?
 
 			except KeyError:
 				# dst file not a result of a rename
@@ -629,21 +648,11 @@ def _operations(
 		elif src_time < dst_time:
 			logger.warning(f"Working copy is older than backed-up copy, skipping update: {relpath}")
 
-	# Empty directories
 	src_only_empty_dirs = src_files.empty_dirs.difference(dst_files.empty_dirs)#.difference(dst_files.nonempty_dirs)
 	for relpath in src_only_empty_dirs:
-		dst_relpath_real = dst_files.real_names[relpath]
-		dst = dst_files.root / dst_relpath_real
-		if not dst.exists():
-			yield ("D+", None, dst, 0, f"+ {dst_relpath_real}{os.sep}")
-		elif not dst.is_dir():
-			logger.error(f"FileExistsError: Could not create dir: {dst_relpath_real}")
-	dst_only_empty_dirs = dst_files.empty_dirs.difference(src_files.empty_dirs)#.difference(src_files.empty_dirs)
-	for relpath in dst_only_empty_dirs:
-		dst_relpath_real = dst_files.real_names[relpath]
-		src = dst_files.root / dst_relpath_real
-		if not any(src.iterdir()):
-			yield ("D-", src, None, 0, f"- {dst_relpath_real}{os.sep}")
+		src_relpath_real = src_files.real_names[relpath]
+		dst = dst_files.root / src_relpath_real
+		yield ("D+", None, dst, 0, f"+ {src_relpath_real}{os.sep}")
 
 def _reverse_dict(old_dict:dict[Any, Any]) -> dict[Any, Any]:
 	'''
@@ -744,7 +753,7 @@ def _delete_empty_dirs(dir:Path, *, root:Path) -> None:
 			dir.rmdir()
 			dir = dir.parent
 	except OSError as e:
-		logger.error(f"{e.__class__.__name__}: Failed to delete: {relpath}{os.sep}")
+		logger.warning(str(e))
 
 def _last_bytes(file_path:Path, n:int = 1024) -> bytes:
 	'''Reads and returns the last `n` bytes of a file.'''
@@ -775,6 +784,13 @@ def _human_readable_size(num_bytes:int) -> str:
 		num_bytes //= 1024
 		i += 1
 	return f"{sign}{round(num_bytes)} {units[i]}"
+
+def error_summary(err):
+	error_type = type(e).__name__
+	#error_code = getattr(e, "errno", "N/A")
+	error_message = getattr(e, "strerror", "Unknown error")
+	#affected_file = getattr(e, "filename", "N/A")
+	return f"{error_type}: {error_message}"
 
 def main() -> None:
 	try:
