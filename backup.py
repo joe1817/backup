@@ -27,10 +27,18 @@ from typing import NamedTuple, Any
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+class DebugInfoFilter(logging.Filter):
+	'''Logging filter that only allows DEBUG and INFO records to pass.'''
+
+	def filter(self, record):
+		return logging.DEBUG <= record.levelno <= logging.INFO
+
 class Results:
 	def __init__(self) -> None:
 		self.trash_root : Path | None = None
 		self.log_file   : Path | None = None
+
+		self.errors     : list[str]   = []
 
 		self.create_success = 0
 		self.rename_success = 0
@@ -42,9 +50,14 @@ class Results:
 		self.delete_error = 0
 		self.byte_diff = 0
 
+		self.dir_create_success = 0
+		self.dir_create_error   = 0
+		self.dir_delete_success = 0
+		self.dir_delete_error   = 0
+
 	@property
 	def err_count(self) -> int:
-		return self.create_error + self.rename_error + self.update_error + self.delete_error
+		return self.create_error + self.rename_error + self.update_error + self.delete_error + self.dir_create_success + self.dir_create_error + self.dir_delete_success + self.dir_delete_error
 
 def backup(
 		src              : str | os.PathLike[str],
@@ -92,12 +105,32 @@ def backup(
 
 	if veryquiet:
 		quiet = True
-	if dry_run and log == "auto":
-		log = None
 
-	with _LogManager(debug=debug, suppress_stdout=quiet, suppress_stderr=veryquiet) as log_manager:
-		assert log_manager is not None
+	if logger.handlers:
+		for handler in list(logger.handlers):
+			logger.removeHandler(handler)
 
+	handler_stdout = None
+	handler_stderr = None
+	handler_file   = None
+
+	if not quiet:
+		handler_stdout = logging.StreamHandler(sys.stdout)
+		handler_stdout.setFormatter(logging.Formatter("%(message)s"))
+		handler_stdout.addFilter(DebugInfoFilter())
+		if debug:
+			handler_stdout.setLevel(logging.DEBUG)
+		else:
+			handler_stdout.setLevel(logging.INFO)
+		logger.addHandler(handler_stdout)
+
+	if not veryquiet:
+		handler_stderr = logging.StreamHandler(sys.stderr)
+		handler_stderr.setFormatter(logging.Formatter("%(message)s"))
+		handler_stderr.setLevel(logging.WARNING)
+		logger.addHandler(handler_stderr)
+
+	try:
 		if not isinstance(src, (str, os.PathLike)):
 			msg = f"Bad type for arg 'src' (expected str or PathLike): {src}"
 			raise TypeError(msg)
@@ -178,8 +211,18 @@ def backup(
 			msg = f"rename_threshold must be non-negative: {rename_threshold}"
 			raise ValueError(msg)
 
+		tmp_log_file = None
 		if log_file is not None:
-			log_manager.log_file = log_file
+			with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", delete=False) as tmp_log:
+				tmp_log_file = Path(tmp_log.name)
+			formatter = logging.Formatter("%(levelname)s: %(message)s")
+			handler_file = logging.FileHandler(tmp_log_file, encoding="utf-8")
+			handler_file.setFormatter(formatter)
+			if debug:
+				handler_file.setLevel(logging.DEBUG)
+			else:
+				handler_file.setLevel(logging.INFO)
+			logger.addHandler(handler_file)
 
 		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {filter=} {ignore_hidden=} {follow_symlinks=} {rename_threshold=} {dry_run=} {log_file=} {debug=} {quiet=} {veryquiet=}")
 
@@ -209,7 +252,9 @@ def backup(
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.delete_error += 1
-						logger.error(f"{e.__class__.__name__}: - {dst_file}")
+						err = str(e)
+						logger.error(err)
+						results.errors.append(err)
 				elif op == "+":
 					try:
 						_copy(src_file, dst_file)
@@ -217,7 +262,9 @@ def backup(
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.create_error += 1
-						logger.error(f"{e.__class__.__name__}: + {dst_file}")
+						err = str(e)
+						logger.error(err)
+						results.errors.append(err)
 				elif op == "U":
 					try:
 						_copy(src_file, dst_file)
@@ -225,27 +272,50 @@ def backup(
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.update_error += 1
-						logger.error(f"{e.__class__.__name__}: U {dst_file}")
+						err = str(e)
+						logger.error(err)
+						results.errors.append(err)
 				elif op == "R":
 					try:
 						_move(src_file, dst_file, delete_empty_dirs_under=dst_root)
 						results.rename_success += 1
 					except OSError as e:
 						results.rename_error += 1
-						logger.error(f"{e.__class__.__name__}: R {src_file} -> {dst_file}")
+						err = str(e)
+						logger.error(err)
+						results.errors.append(err)
 				elif op == "D+":
 					try:
 						os.makedirs(dst_file, exist_ok=True)
+						results.dir_create_success += 1
 					except OSError as e:
-						logger.error(f"{e.__class__.__name__}: + {dst_file}{os.sep}")
+						results.dir_create_error += 1
+						err = str(e)
+						logger.error(err)
+						results.errors.append(err)
 				elif op == "D-":
 					try:
 						_delete_empty_dirs(src_file, root=dst_root)
+						results.dir_delete_success += 1
 					except OSError as e:
-						logger.error(f"{e.__class__.__name__}: - {src_file}{os.sep}")
+						results.dir_delete_error += 1
+						err = str(e)
+						logger.error(err)
+						results.errors.append(err)
 				else:
 					assert False
 
+		return results
+
+	except KeyboardInterrupt:
+		logger.critical(f"Cancelled by user.")
+	except (TypeError, ValueError) as e:
+		logger.critical(f"Input Error: {e}")
+	except Exception as e:
+		logger.critical(str(e))
+		logger.debug(traceback.format_exc())
+
+	finally:
 		if dry_run:
 			logger.info("")
 			logger.info("*** DRY RUN ***")
@@ -258,7 +328,30 @@ def backup(
 			logger.info(f"Delete Success: {results.delete_success}" + (f" / Failed: {results.delete_error}" if results.delete_error else ""))
 			logger.info(f"Net Change: {_human_readable_size(results.byte_diff)}")
 
-		return results
+		if results.err_count:
+			logger.info("")
+			logger.info(f"There were {results.err_count} errors.")
+			if results.err_count <= 10:
+				logger.info("Errors are reprinted below for convenience.")
+				for error in results.errors:
+					logger.info(error)
+
+		if log_file:
+			logger.info("")
+			logger.info(f"Log file: {log_file}")
+
+		if handler_stdout:
+			logger.removeHandler(handler_stdout)
+			handler_stdout.close()
+
+		if handler_stderr:
+			logger.removeHandler(handler_stderr)
+			handler_stderr.close()
+
+		if handler_file:
+			logger.removeHandler(handler_file)
+			handler_file.close()
+			tmp_log_file.replace(log_file)
 
 class _Filter:
 	def __init__(self, filter_string:str, *, ignore_hidden:bool = False):
@@ -630,122 +723,6 @@ def _human_readable_size(num_bytes:int) -> str:
 		num_bytes //= 1024
 		i += 1
 	return f"{sign}{round(num_bytes)} {units[i]}"
-
-class _LogManager:
-	'''ContextManager that handles creation the log file and records whether to suppress stdout.'''
-
-	def __init__(self ,*, debug:bool=False, suppress_stdout:bool = False, suppress_stderr:bool = False):
-		self._log_file           : Path | None = None # the working copy of the log file
-		self.final_log_file      : Path | None = None # where to move the working copy upon completion
-		self.log_handler_file    : logging.FileHandler | None = None
-
-		self.debug               : bool = debug
-		self.suppress_stdout     : bool = suppress_stdout
-		self.suppress_stderr     : bool = suppress_stderr
-		self.log_handler_console = _ConsoleHandler(self)
-
-		formatter = logging.Formatter("%(message)s")
-		self.log_handler_console.setFormatter(formatter)
-		if self.debug:
-			self.log_handler_console.setLevel(logging.DEBUG)
-		else:
-			self.log_handler_console.setLevel(logging.INFO)
-		logger.addHandler(self.log_handler_console)
-
-	@property
-	def log_file(self):
-		return self._log_file
-
-	@log_file.setter
-	def log_file(self, path:Path | None) -> None:
-		# file log
-		if path is not None:
-			self.final_log_file = path
-			with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", delete=False) as tmp_log:
-				self._log_file = Path(tmp_log.name)
-			formatter = logging.Formatter("%(levelname)s: %(message)s")
-			self.log_handler_file = logging.FileHandler(self.log_file, encoding="utf-8")
-			self.log_handler_file.setFormatter(formatter)
-			if self.debug:
-				self.log_handler_file.setLevel(logging.DEBUG)
-			else:
-				self.log_handler_file.setLevel(logging.INFO)
-			logger.addHandler(self.log_handler_file)
-			self.log_handler_console.log_file = path
-		elif self.log_handler_file is not None:
-			assert self.final_log_file is not None
-			logger.removeHandler(self.log_handler_file)
-			self.log_handler_file.close()
-			self.log_file.replace(self.final_log_file)
-			self._log_file = None
-			self.final_log_file = None
-			self.log_handler_file = None
-			self.log_handler_console.log_file = None
-
-	def __enter__(self):
-		return self
-
-	def __exit__(self, exc_type, exc_value, tb) -> None:
-		if exc_type:
-			if exc_type is TypeError or exc_type is ValueError:
-				logger.critical(f"Input Error: {exc_value}")
-			elif exc_type is KeyboardInterrupt:
-				logger.critical(f"Cancelled by user.")
-			else:
-				logger.critical(f"{exc_type.__name__}: {exc_value}")
-				logger.debug(traceback.format_exc())
-		else:
-			logger.info("Finished successfully.")
-
-		if self.log_handler_file is not None:
-			assert self.final_log_file is not None
-			logger.removeHandler(self.log_handler_file)
-			self.log_handler_file.close()
-			self.log_file.replace(self.final_log_file)
-			self.log_file = self.final_log_file
-			self.final_log_file = None
-			self.log_handler_file = None
-			self.log_handler_console.log_file = None
-
-		self.log_handler_console.close()
-		logger.removeHandler(self.log_handler_console)
-
-class _ConsoleHandler(logging.Handler):
-	'''Handler for log messages presented to the user on the command line.'''
-
-	def __init__(self, log_manager : _LogManager, *, max_err_recap : int = 10):
-		super().__init__()
-		self.log_manager   : _LogManager = log_manager
-		self.max_err_recap : int = max_err_recap
-		self.errs          : list[str] = []
-		self.count_errs    : int = 0
-		self.critical_err  : bool = False
-		self.log_file      : Path | None = None
-
-	def emit(self, record):
-		msg = self.format(record)+"\n"
-		if record.levelname == "DEBUG" or record.levelname == "INFO":
-			if not self.log_manager.suppress_stdout:
-				sys.stdout.write(msg)
-		else:
-			self.count_errs += 1
-			if len(self.errs) < self.max_err_recap:
-				self.errs.append(msg)
-			if not self.log_manager.suppress_stderr:
-				sys.stderr.write(msg)
-			if record.levelname == "CRITICAL":
-				self.critical_err = True
-
-	def close(self):
-		if not self.log_manager.suppress_stdout:
-			if self.log_file is not None:
-				sys.stdout.write(f"This output is saved at {self.log_file}.\n")
-			if not self.critical_err:
-				sys.stdout.write(f"There were {self.count_errs} errors.\n")
-				if 0 < len(self.errs) <= self.max_err_recap:
-					sys.stdout.write("Errors are reprinted below for convenience:\n")
-					for err in self.errs:
-						sys.stdout.write(err)
 
 class _ArgParser:
 	'''Argument parser for when this python file is run with arguments instead of an imported module.'''
