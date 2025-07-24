@@ -19,11 +19,10 @@ import traceback
 from pathlib import Path
 from fnmatch import fnmatch
 from collections import Counter
-from collections import namedtuple
 from types import SimpleNamespace
 from functools import lru_cache
 from direntry_walk import direntry_walk
-from typing import Any
+from typing import NamedTuple, Any
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -190,8 +189,8 @@ def backup(
 		logger.info("-> " + str(dst_root))
 		logger.info("-" * width)
 
-		src_files = _FileList(src_root, filter=filter, ignore_hidden=ignore_hidden, follow_symlinks=follow_symlinks)
-		dst_files = _FileList(dst_root, filter=filter, ignore_hidden=ignore_hidden, follow_symlinks=follow_symlinks)
+		src_files = _scandir(src_root, filter=filter, ignore_hidden=ignore_hidden, follow_symlinks=follow_symlinks)
+		dst_files = _scandir(dst_root, filter=filter, ignore_hidden=ignore_hidden, follow_symlinks=follow_symlinks)
 
 		for op, src_file, dst_file, byte_diff, summary in _operations(
 			src_files,
@@ -309,7 +308,19 @@ class _Filter:
 				return action
 		return default
 
-class _FileList:
+class _Metadata(NamedTuple):
+	size  : int
+	mtime : float
+
+class _FileList(NamedTuple):
+	root             : Path
+	relpath_to_stats : dict[str, _Metadata]
+	real_names       : dict[str, str]
+	empty_dirs       : set[str]
+	#nonempty_dirs   : set[str]
+	visited_inodes   : set[int]
+
+def _scandir(root:Path, *, filter:str = "+ **/*/ **/*", ignore_hidden:bool = False, follow_symlinks:bool = False) -> _FileList:
 	'''
 	Retrieves file relative paths (relative to `root`), sizes, and mtimes for all descendant files inside a directory.
 
@@ -320,67 +331,66 @@ class _FileList:
 		follow_symlinks (bool) : Whether to follow symbolic links under `src` and `dst`. Note that `src` and `dst` themselves will be followed if either is a symlink. (Defaults to `False`.)
 	'''
 
-	def __init__(self, root:Path, *, filter:str = "+ **/*/ **/*", ignore_hidden:bool = False, follow_symlinks:bool = False):
-		self.root             : Path = root
-		self.relpath_to_stats : dict[str, Metadata] = {}
-		self.real_names       : dict[str, str] = {}
-		self.empty_dirs       : set[str] = set()
-		#self.nonempty_dirs   : set[str] = set()
-		self.visited_inodes   : set[int] = set()
+	file_list = _FileList(
+		root             = root,
+		relpath_to_stats = {},
+		real_names       = {},
+		empty_dirs       = set(),
+		visited_inodes   = set(),
+	)
+	f = _Filter(filter, ignore_hidden=ignore_hidden)
 
-		Metadata = namedtuple("Metadata", ["size", "mtime"])
+	for dir, subdirnames, file_entries in direntry_walk(root, followlinks=follow_symlinks):
+		logger.debug(f"scanning: {dir}")
 
-		f = _Filter(filter, ignore_hidden=ignore_hidden)
+		if follow_symlinks:
+			inode = os.stat(dir).st_ino
+			if inode in file_list.visited_inodes:
+				raise ValueError(f"Symlink circular reference: {dir}")
+			file_list.visited_inodes.add(inode)
 
-		for dir, subdirnames, file_entries in direntry_walk(root, followlinks=follow_symlinks):
-			logger.debug(f"scanning: {dir}")
+		# sorting may be needed if _listdir is changed to yield folder-by-folder
+		#subdirnames.sort()
+		#file_entries.sort()
 
-			if follow_symlinks:
-				inode = os.stat(dir).st_ino
-				if inode in self.visited_inodes:
-					raise ValueError(f"Symlink circular reference: {dir}")
-				self.visited_inodes.add(inode)
+		dir_relpath = os.path.relpath(dir, root)
+		normed_dir_relpath = os.path.normcase(dir_relpath)
 
-			# sorting may be needed if _listdir is changed to yield folder-by-folder
-			#subdirnames.sort()
-			#file_entries.sort()
+		# catalog empty directory
+		if not file_entries and not subdirnames:
+			file_list.empty_dirs.add(dir_relpath)
+			file_list.real_names[normed_dir_relpath] = dir_relpath
+			continue
+		#else:
+		#	self.nonempty_dirs.add(dir_relpath)
 
-			dir_relpath = os.path.relpath(dir, root)
-			normed_dir_relpath = os.path.normcase(dir_relpath)
-
-			# catalog empty directory
-			if not file_entries and not subdirnames:
-				self.empty_dirs.add(dir_relpath)
-				self.real_names[normed_dir_relpath] = dir_relpath
+		# prune search tree
+		i = 0
+		while i < len(subdirnames):
+			# symlinks are encountered here but they aren't followed unless followlinks is True
+			subdirname = subdirnames[i]
+			subdir_path = os.path.join(dir, subdirname)
+			subdir_relpath = os.path.relpath(subdir_path, root)
+			if not f.filter(subdir_relpath + os.sep):
+				del subdirnames[i]
 				continue
-			#else:
-			#	self.nonempty_dirs.add(dir_relpath)
+			i += 1
 
-			# prune search tree
-			i = 0
-			while i < len(subdirnames):
-				# symlinks are encountered here but they aren't followed unless followlinks is True
-				subdirname = subdirnames[i]
-				subdir_path = os.path.join(dir, subdirname)
-				subdir_relpath = os.path.relpath(subdir_path, root)
-				if not f.filter(subdir_relpath + os.sep):
-					del subdirnames[i]
-					continue
-				i += 1
+		# prune files
+		for entry in file_entries:
+			# ignore file symlinks for now, shutil.copy2() would follow and copy their contents if included in the output
+			if entry.is_symlink():
+				continue
+			filename = entry.name
+			file_path = os.path.join(dir, filename)
+			file_relpath = os.path.relpath(file_path, root)
+			normed_file_relpath = os.path.normcase(file_relpath)
+			if (f.filter(file_relpath)):
+				meta = _Metadata(size = entry.stat().st_size, mtime = entry.stat().st_mtime)
+				file_list.relpath_to_stats[normed_file_relpath] = meta
+				file_list.real_names[normed_file_relpath] = file_relpath
 
-			# prune files
-			for entry in file_entries:
-				# ignore file symlinks for now, shutil.copy2() would follow and copy their contents if included in the output
-				if entry.is_symlink():
-					continue
-				filename = entry.name
-				file_path = os.path.join(dir, filename)
-				file_relpath = os.path.relpath(file_path, root)
-				normed_file_relpath = os.path.normcase(file_relpath)
-				if (f.filter(file_relpath)):
-					meta = Metadata(entry.stat().st_size, entry.stat().st_mtime)
-					self.relpath_to_stats[normed_file_relpath] = meta
-					self.real_names[normed_file_relpath] = file_relpath
+	return file_list
 
 def _operations(
 		src_files        : _FileList,
