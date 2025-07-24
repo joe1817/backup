@@ -33,6 +33,97 @@ class DebugInfoFilter(logging.Filter):
 	def filter(self, record):
 		return logging.DEBUG <= record.levelno <= logging.INFO
 
+class _ArgParser:
+	'''Argument parser for when this python file is run with arguments instead of an imported module.'''
+
+	parser = argparse.ArgumentParser(
+		description="Copy new and updated files from one directory to another, update renamed files' names to match where possible, and optionally delete non-matching files.",
+		epilog="(c) 2025 Joe Walter"
+	)
+
+	parser.add_argument("src_root", help="The root directory to copy files from.")
+	parser.add_argument("dst_root", help="The root directory to copy files to.")
+	parser.add_argument("-t", "--trash-root", metavar="path", nargs="?", type=str, default=None, const="auto", help="The root directory to move 'extra' files (those that are in `dst_root` but not `src_root`). Must be on the same filesystem as `dst_root`. If set to \"auto\", then a directory will automatically be made next to `dst_root`. Extra files will not be moved if this option is omitted.")
+
+	parser.add_argument("-f", "--filter", metavar="filter_string", nargs=1, type=str, default="+ **/*/ **/*", help="The filter to include/exclude files and directories. Similar to rsync, the format of the filter string is: (+ or -), followed by a list of one of more relative path patterns, and otionally repeat from the start. Including (+) or excluding (-) of entries is determined by the preceding symbol of the first matching pattern. Included files will be copied, while included directories will be searched. Each Pattern ending with \"/\" will apply to directories only. Otherise the pattern will apply only to files. (Defaults to \"+ **/*/ **/*\", which searches all directories and copies all files.)")
+	parser.add_argument("--ignore-hidden", action="store_true", default=False, help="Skip hidden files by default. That is, wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., \"**/.*\") will still match these entries.")
+	parser.add_argument("-L", "--follow-symlinks", action="store_true", default=False, help="Whether to follow symbolic links under `src_root` and `dst_root`. Note that `src_root` and `dst_root` themselves will be followed regardless of this argument.")
+	parser.add_argument("-r", "--rename-threshold", metavar="size", nargs=1, type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root to match those in `src_root`. Renamed files below this threshold will be simply deleted in dst_root and their replacements copied over.")
+	parser.add_argument("-m", "--metadata_only", action="store_true", default=False, help="Use only metadata in determining which files in `dst_root` are the result of a rename. Otherwise, backup will also compare the last 1kb of files.")
+	parser.add_argument("--dry-run", action="store_true", default=False, help="Forgo performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console.")
+
+	parser.add_argument("--log", metavar="path", nargs="?", type=str, default=None, const="auto", help="File to write log messages to. If set to \"auto\", then a tempfile will be used for the log, and it will be moved to the user's home directory after the backup is done. If absent, then no logging will be performed.")
+	parser.add_argument("-d", "--debug", action="store_true", default=False, help="Log debug messages.")
+	parser.add_argument("-q", action="count", default=0, help="Forgo printing to stdout (-q) and stderr (-qq).")
+
+	@staticmethod
+	def parse(args:list[str]) -> argparse.Namespace:
+		parsed_args = _ArgParser.parser.parse_args(args)
+		parsed_args.quiet     = parsed_args.q >= 1
+		parsed_args.veryquiet = parsed_args.q >= 2
+		del parsed_args.q
+		return parsed_args
+
+class _Filter:
+	def __init__(self, filter_string:str, *, ignore_hidden:bool = False):
+		self.patterns = []
+		implicit_dirs : set[str] = set()
+
+		filter_string = filter_string.strip()
+		for action, patterns in re.findall(r"(\+|-)\s+((?:(?:'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-])\s*)+)", filter_string):
+			action = action == "+"
+			if not action:
+				# clear if - action
+				implicit_dirs = set()
+			for pattern in re.findall(r"'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-]", patterns):
+				if pattern[0] == "'" or pattern[0] == "\"":
+					pattern = pattern[1:-1]
+				if pattern[:2] == ".\\" or pattern[:2] == "./":
+					pattern = pattern[2:]
+
+				if pattern == ".." or re.search("^\\\\.\\.[\\\\/]", pattern) or re.search("[\\\\/]\\.\\.[\\\\/]", pattern) or re.search("[\\\\/]\\.\\.$", pattern):
+					raise ValueError(f"Parent directories ('..') are not supported in pattern arguments to include/exclude: {pattern}")
+				if os.path.isabs(pattern):
+					raise ValueError(f"Absolute paths are not supported as arguments to include/exclude: {pattern}")
+
+				if pattern == "":
+					continue
+
+				regex = glob.translate(pattern, recursive=True, include_hidden=(not ignore_hidden))
+				reobj = re.compile(regex)
+				self.patterns.append((action, reobj))
+
+				# include parent dirs for each include pattern
+				if action:
+					while True:
+						pattern = os.path.dirname(pattern)
+						if pattern == "":
+							break
+						if pattern in implicit_dirs:
+							break
+						implicit_dirs.add(pattern)
+						regex = glob.translate(pattern + "/", recursive=True, include_hidden=(not ignore_hidden))
+						reobj = re.compile(regex)
+						self.patterns.append((action, reobj))
+
+	def filter(self, relpath:str, default:bool = False):
+		for action, reobj in self.patterns:
+			if reobj.match(relpath):
+				return action
+		return default
+
+class _Metadata(NamedTuple):
+	size  : int
+	mtime : float
+
+class _FileList(NamedTuple):
+	root             : Path
+	relpath_to_stats : dict[str, _Metadata]
+	real_names       : dict[str, str]
+	empty_dirs       : set[str]
+	#nonempty_dirs   : set[str]
+	visited_inodes   : set[int]
+
 class Results:
 	def __init__(self) -> None:
 		self.trash_root : Path | None = None
@@ -58,6 +149,25 @@ class Results:
 	@property
 	def err_count(self) -> int:
 		return self.create_error + self.rename_error + self.update_error + self.delete_error + self.dir_create_success + self.dir_create_error + self.dir_delete_success + self.dir_delete_error
+
+def backup2(args:list[str]) -> Results:
+	'''Run backup with command line arguments.'''
+
+	parsed_args = _ArgParser.parse(args)
+	return backup(
+		parsed_args.src_root,
+		parsed_args.dst_root,
+		trash            = parsed_args.trash_root,
+		filter           = parsed_args.filter,
+		ignore_hidden    = parsed_args.ignore_hidden,
+		rename_threshold = parsed_args.rename_threshold,
+		metadata_only    = parsed_args.metadata_only,
+		dry_run          = parsed_args.dry_run,
+		log              = parsed_args.log,
+		debug            = parsed_args.debug,
+		quiet            = parsed_args.quiet,
+		veryquiet        = parsed_args.veryquiet
+	)
 
 def backup(
 		src              : str | os.PathLike[str],
@@ -352,66 +462,6 @@ def backup(
 			logger.removeHandler(handler_file)
 			handler_file.close()
 			tmp_log_file.replace(log_file)
-
-class _Filter:
-	def __init__(self, filter_string:str, *, ignore_hidden:bool = False):
-		self.patterns = []
-		implicit_dirs : set[str] = set()
-
-		filter_string = filter_string.strip()
-		for action, patterns in re.findall(r"(\+|-)\s+((?:(?:'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-])\s*)+)", filter_string):
-			action = action == "+"
-			if not action:
-				# clear if - action
-				implicit_dirs = set()
-			for pattern in re.findall(r"'[^']*'|\"[^\"]*\"|\S{2,}|[^\s\+-]", patterns):
-				if pattern[0] == "'" or pattern[0] == "\"":
-					pattern = pattern[1:-1]
-				if pattern[:2] == ".\\" or pattern[:2] == "./":
-					pattern = pattern[2:]
-
-				if pattern == ".." or re.search("^\\\\.\\.[\\\\/]", pattern) or re.search("[\\\\/]\\.\\.[\\\\/]", pattern) or re.search("[\\\\/]\\.\\.$", pattern):
-					raise ValueError(f"Parent directories ('..') are not supported in pattern arguments to include/exclude: {pattern}")
-				if os.path.isabs(pattern):
-					raise ValueError(f"Absolute paths are not supported as arguments to include/exclude: {pattern}")
-
-				if pattern == "":
-					continue
-
-				regex = glob.translate(pattern, recursive=True, include_hidden=(not ignore_hidden))
-				reobj = re.compile(regex)
-				self.patterns.append((action, reobj))
-
-				# include parent dirs for each include pattern
-				if action:
-					while True:
-						pattern = os.path.dirname(pattern)
-						if pattern == "":
-							break
-						if pattern in implicit_dirs:
-							break
-						implicit_dirs.add(pattern)
-						regex = glob.translate(pattern + "/", recursive=True, include_hidden=(not ignore_hidden))
-						reobj = re.compile(regex)
-						self.patterns.append((action, reobj))
-
-	def filter(self, relpath:str, default:bool = False):
-		for action, reobj in self.patterns:
-			if reobj.match(relpath):
-				return action
-		return default
-
-class _Metadata(NamedTuple):
-	size  : int
-	mtime : float
-
-class _FileList(NamedTuple):
-	root             : Path
-	relpath_to_stats : dict[str, _Metadata]
-	real_names       : dict[str, str]
-	empty_dirs       : set[str]
-	#nonempty_dirs   : set[str]
-	visited_inodes   : set[int]
 
 def _scandir(root:Path, *, filter:str = "+ **/*/ **/*", ignore_hidden:bool = False, follow_symlinks:bool = False) -> _FileList:
 	'''
@@ -723,56 +773,6 @@ def _human_readable_size(num_bytes:int) -> str:
 		num_bytes //= 1024
 		i += 1
 	return f"{sign}{round(num_bytes)} {units[i]}"
-
-class _ArgParser:
-	'''Argument parser for when this python file is run with arguments instead of an imported module.'''
-
-	parser = argparse.ArgumentParser(
-		description="Copy new and updated files from one directory to another, update renamed files' names to match where possible, and optionally delete non-matching files.",
-		epilog="(c) 2025 Joe Walter"
-	)
-
-	parser.add_argument("src_root", help="The root directory to copy files from.")
-	parser.add_argument("dst_root", help="The root directory to copy files to.")
-	parser.add_argument("-t", "--trash-root", metavar="path", nargs="?", type=str, default=None, const="auto", help="The root directory to move 'extra' files (those that are in `dst_root` but not `src_root`). Must be on the same filesystem as `dst_root`. If set to \"auto\", then a directory will automatically be made next to `dst_root`. Extra files will not be moved if this option is omitted.")
-
-	parser.add_argument("-f", "--filter", metavar="filter_string", nargs=1, type=str, default="+ **/*/ **/*", help="The filter to include/exclude files and directories. Similar to rsync, the format of the filter string is: (+ or -), followed by a list of one of more relative path patterns, and otionally repeat from the start. Including (+) or excluding (-) of entries is determined by the preceding symbol of the first matching pattern. Included files will be copied, while included directories will be searched. Each Pattern ending with \"/\" will apply to directories only. Otherise the pattern will apply only to files. (Defaults to \"+ **/*/ **/*\", which searches all directories and copies all files.)")
-	parser.add_argument("--ignore-hidden", action="store_true", default=False, help="Skip hidden files by default. That is, wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., \"**/.*\") will still match these entries.")
-	parser.add_argument("-L", "--follow-symlinks", action="store_true", default=False, help="Whether to follow symbolic links under `src_root` and `dst_root`. Note that `src_root` and `dst_root` themselves will be followed regardless of this argument.")
-	parser.add_argument("-r", "--rename-threshold", metavar="size", nargs=1, type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root to match those in `src_root`. Renamed files below this threshold will be simply deleted in dst_root and their replacements copied over.")
-	parser.add_argument("-m", "--metadata_only", action="store_true", default=False, help="Use only metadata in determining which files in `dst_root` are the result of a rename. Otherwise, backup will also compare the last 1kb of files.")
-	parser.add_argument("--dry-run", action="store_true", default=False, help="Forgo performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console.")
-
-	parser.add_argument("--log", metavar="path", nargs="?", type=str, default=None, const="auto", help="File to write log messages to. If set to \"auto\", then a tempfile will be used for the log, and it will be moved to the user's home directory after the backup is done. If absent, then no logging will be performed.")
-	parser.add_argument("-d", "--debug", action="store_true", default=False, help="Log debug messages.")
-	parser.add_argument("-q", action="count", default=0, help="Forgo printing to stdout (-q) and stderr (-qq).")
-
-	@staticmethod
-	def parse(args:list[str]) -> argparse.Namespace:
-		parsed_args = _ArgParser.parser.parse_args(args)
-		parsed_args.quiet     = parsed_args.q >= 1
-		parsed_args.veryquiet = parsed_args.q >= 2
-		del parsed_args.q
-		return parsed_args
-
-def backup2(args:list[str]) -> Results:
-	'''Run backup with command line arguments.'''
-
-	parsed_args = _ArgParser.parse(args)
-	return backup(
-		parsed_args.src_root,
-		parsed_args.dst_root,
-		trash            = parsed_args.trash_root,
-		filter           = parsed_args.filter,
-		ignore_hidden    = parsed_args.ignore_hidden,
-		rename_threshold = parsed_args.rename_threshold,
-		metadata_only    = parsed_args.metadata_only,
-		dry_run          = parsed_args.dry_run,
-		log              = parsed_args.log,
-		debug            = parsed_args.debug,
-		quiet            = parsed_args.quiet,
-		veryquiet        = parsed_args.veryquiet
-	)
 
 def main() -> None:
 	try:
