@@ -106,7 +106,7 @@ class _Filter:
 						reobj = re.compile(regex)
 						self.patterns.append((action, reobj))
 
-	def filter(self, relpath:str, default:bool = False):
+	def filter(self, relpath:str, default:bool = False) -> bool:
 		for action, reobj in self.patterns:
 			if reobj.match(relpath):
 				return action
@@ -415,8 +415,6 @@ def backup(
 				else:
 					assert False
 
-		return results
-
 	except KeyboardInterrupt:
 		logger.critical(f"Cancelled by user.")
 	except (TypeError, ValueError) as e:
@@ -461,7 +459,11 @@ def backup(
 		if handler_file:
 			logger.removeHandler(handler_file)
 			handler_file.close()
+			assert tmp_log_file is not None
+			assert log_file is not None
 			tmp_log_file.replace(log_file)
+
+	return results
 
 def _scandir(root:Path, *, filter:str = "+ **/*/ **/*", ignore_hidden:bool = False, follow_symlinks:bool = False) -> _FileList:
 	'''
