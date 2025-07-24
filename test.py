@@ -58,7 +58,7 @@ def create_file_structure(root_dir:Path, structure:dict, *, _delay:float = 0.01)
 			create_file_structure(file_path, content, _delay=0)
 		elif isinstance(content, (tuple, list)):
 			# Create file with modtime and content
-			file_path.write_text(content[0])
+			file_path.write_text(content[0] or "")
 			mtime = float(content[1])
 			os.utime(file_path, (mtime, mtime))
 		elif content is None:
@@ -440,6 +440,62 @@ class TestBackup(unittest.TestCase):
 			)
 			self.assertEqual(hash_directory(src2), hash_directory(dst2))
 		assert not test_root.exists()
+
+		################################################################################
+
+		with tempfile.TemporaryDirectory(suffix=None, prefix=None, dir=None) as temp_root:
+			test_root = Path(temp_root)
+			file_structure = {
+				"dst": {
+					"a1": {
+						"a": (None, 1)
+					},
+					"b1": {},
+					"c1": (None, 1),
+
+					"b2": {
+						"a": (None, 1)
+					},
+					"c2": {},
+					"a2": (None, 1),
+
+					"c3": {
+						"a": (None, 1)
+					},
+					"a3": {},
+					"b3": (None, 1),
+				},
+				"src": {
+					"a1": {
+						"a": None
+					},
+					"b1": {},
+					"c1": None,
+
+					"a2": {
+						"a": None
+					},
+					"b2": {},
+					"c2": None,
+
+					"a3": {
+						"a": None
+					},
+					"b3": {},
+					"c3": None,
+				},
+			}
+			create_file_structure(test_root, file_structure)
+			src = test_root / "src"
+			dst = test_root / "dst"
+
+			results = backup.backup(
+				src,
+				dst,
+				trash = "auto",
+				quiet = True,
+			)
+			self.assertEqual(hash_directory(src), hash_directory(dst))
 
 if __name__ == "__main__":
 	try:
