@@ -226,7 +226,7 @@ class TestBackup(unittest.TestCase):
 
 			################################################################################
 
-			files = backup._FileList(
+			files = backup._scandir(
 				root = test_root,
 				filter = "- b/ c/ + **/*/ **/1.???"
 			)
@@ -245,7 +245,7 @@ class TestBackup(unittest.TestCase):
 
 			################################################################################
 
-			files = backup._FileList(
+			files = backup._scandir(
 				root = test_root,
 				filter = "+ a/a?/a?b/*",
 			)
@@ -290,13 +290,13 @@ class TestBackup(unittest.TestCase):
 			a_root = test_root / "a"
 			b_root = test_root / "b"
 			c_root = test_root / "c"
-			a_files = backup._FileList(
+			a_files = backup._scandir(
 				root = a_root
 			)
-			b_files = backup._FileList(
+			b_files = backup._scandir(
 				root = b_root
 			)
-			c_files = backup._FileList(
+			c_files = backup._scandir(
 				root = c_root
 			)
 
