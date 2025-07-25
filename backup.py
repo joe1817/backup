@@ -47,7 +47,7 @@ class _ArgParser:
 
 	parser.add_argument("-f", "--filter", metavar="filter_string", nargs=1, type=str, default="+ **/*/ **/*", help="The filter to include/exclude files and directories. Similar to rsync, the format of the filter string is: (+ or -), followed by a list of one of more relative path patterns, and otionally repeat from the start. Including (+) or excluding (-) of entries is determined by the preceding symbol of the first matching pattern. Included files will be copied, while included directories will be searched. Each Pattern ending with \"/\" will apply to directories only. Otherise the pattern will apply only to files. (Defaults to \"+ **/*/ **/*\", which searches all directories and copies all files.)")
 	parser.add_argument("--ignore-hidden", action="store_true", default=False, help="Skip hidden files by default. That is, wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., \"**/.*\") will still match these entries.")
-	parser.add_argument("-L", "--follow-symlinks", action="store_true", default=False, help="Whether to follow symbolic links under `src_root` and `dst_root`. Note that `src_root` and `dst_root` themselves will be followed regardless of this argument.")
+	parser.add_argument("-L", "--follow-symlinks", action="store_true", default=False, help="Follow symbolic links under `src_root` and `dst_root`. Note that `src_root` and `dst_root` themselves will be followed regardless of this flag.")
 	parser.add_argument("-r", "--rename-threshold", metavar="size", nargs=1, type=int, default=20000, help="The minimum size in bytes needed to consider renaming files in dst_root to match those in `src_root`. Renamed files below this threshold will be simply deleted in dst_root and their replacements copied over.")
 	parser.add_argument("-m", "--metadata_only", action="store_true", default=False, help="Use only metadata in determining which files in `dst_root` are the result of a rename. Otherwise, backup will also compare the last 1kb of files.")
 	parser.add_argument("--dry-run", action="store_true", default=False, help="Forgo performing any operation that would make a filesystem change. Changes that would have occurred will still be printed to console.")
@@ -65,6 +65,8 @@ class _ArgParser:
 		return parsed_args
 
 class _Filter:
+	'''Object that holds a parsed filter string for quicker file filtering.'''
+
 	def __init__(self, filter_string:str, *, ignore_hidden:bool = False):
 		self.patterns = []
 		implicit_dirs : set[str] = set()
@@ -107,16 +109,22 @@ class _Filter:
 						self.patterns.append((action, reobj))
 
 	def filter(self, relpath:str, default:bool = False) -> bool:
+		'''Compare the file path against the filter string.'''
+
 		for action, reobj in self.patterns:
 			if reobj.match(relpath):
 				return action
 		return default
 
 class _Metadata(NamedTuple):
+	'''File metadata that will be used to find probable duplicates.'''
+
 	size  : int
 	mtime : float
 
 class _FileList(NamedTuple):
+	'''File and directory information returned by `_scandir()`.'''
+
 	root             : Path
 	relpath_to_stats : dict[str, _Metadata]
 	real_names       : dict[str, str]
@@ -125,6 +133,8 @@ class _FileList(NamedTuple):
 	visited_inodes   : set[int]
 
 class Results:
+	'''Various statistics and other information returned by `backup()`.'''
+
 	def __init__(self) -> None:
 		self.trash_root : Path | None = None
 		self.log_file   : Path | None = None
@@ -341,7 +351,6 @@ def backup(
 		logger.debug(f"Starting backup: {src_root=} {dst_root=} {trash_root=} {filter=} {ignore_hidden=} {follow_symlinks=} {rename_threshold=} {dry_run=} {log_file=} {debug=} {quiet=} {veryquiet=}")
 
 		width = max(len(str(src_root)), len(str(dst_root))) + 3
-		#logger.info("=" * width)
 		logger.info("   " + str(src_root))
 		logger.info("-> " + str(dst_root))
 		logger.info("-" * width)
@@ -481,13 +490,13 @@ def backup(
 
 def _scandir(root:Path, *, filter:str = "+ **/*/ **/*", ignore_hidden:bool = False, follow_symlinks:bool = False) -> _FileList:
 	'''
-	Retrieves file relative paths (relative to `root`), sizes, and mtimes for all descendant files inside a directory.
+	Retrieves file information for all files under `root`, including relative paths (relative to `root`), sizes, and modification times.
 
     Args
 		root (Path)            : The directory to search.
 		filter (str)           : The filter to include/exclude files and directories. Include entries by preceding a space-separated list with "+", and exclude with "-". Included files will be copied, while included directories will be searched. Each pattern ending with a slash will only apply to directories. Otherise the pattern will only apply to files. (Defaults to `+ **/*/ **/*`.)
 		ignore_hidden (bool)   : Whether to skip hidden files by default. If `True`, then wildcards in glob patterns will not match entries beginning with a dot. However, globs containing a dot (e.g., "**/.*") will still match these entries. (Defaults to `False`.)
-		follow_symlinks (bool) : Whether to follow symbolic links under `src` and `dst`. Note that `src` and `dst` themselves will be followed if either is a symlink. (Defaults to `False`.)
+		follow_symlinks (bool) : Whether to follow symbolic links under `root`. Note that `root` itself will be followed regardless of this argument. (Defaults to `False`.)
 	'''
 
 	file_list = _FileList(
@@ -559,7 +568,7 @@ def _operations(
 		rename_threshold : int  | None,
 		metadata_only    : bool
 	):
-	'''Generator of the list of filesystem operations to perform for this backup.'''
+	'''Generator of filesystem operations to perform for this backup.'''
 
 	assert trash_root is None or isinstance(trash_root, Path)
 
@@ -568,12 +577,17 @@ def _operations(
 
 	src_relpaths = set(src_relpath_stats.keys())
 	dst_relpaths = set(dst_relpath_stats.keys())
+	logger.debug(f"{src_relpaths=}")
+	logger.debug(f"{dst_relpaths=}")
 
 	src_only_relpaths = sorted(src_relpaths.difference(dst_relpaths))
 	dst_only_relpaths = sorted(dst_relpaths.difference(src_relpaths))
 	both_relpaths     = sorted(src_relpaths.intersection(dst_relpaths))
+	logger.debug(f"{src_only_relpaths=}")
+	logger.debug(f"{dst_only_relpaths=}")
+	logger.debug(f"{both_relpaths=}")
 
-	# Delete empty dirs now in case any new files needs to take their places
+	# Delete empty directories now in case any new files needs to take their places
 	dst_only_empty_dirs = dst_files.empty_dirs.difference(src_files.empty_dirs)#.difference(src_files.empty_dirs)
 	for relpath in dst_only_empty_dirs:
 		dst_relpath_real = dst_files.real_names[relpath]
@@ -581,6 +595,7 @@ def _operations(
 		assert not any(src.iterdir())
 		yield ("D-", src, None, 0, f"- {dst_relpath_real}{os.sep}")
 
+	# Rename files
 	if rename_threshold is not None:
 		src_only_relpath_from_stats = _reverse_dict({path:src_relpath_stats[path] for path in src_only_relpaths})
 		dst_only_relpath_from_stats = _reverse_dict({path:dst_relpath_stats[path] for path in dst_only_relpaths})
@@ -616,21 +631,22 @@ def _operations(
 				src = dst_files.root / rename_from
 				dst = dst_files.root / rename_to
 
-				yield ("R", src, dst, 0, f"R {rename_from} -> {rename_to}") ####################################### TODO what if dst exists?
+				yield ("R", src, dst, 0, f"R {rename_from} -> {rename_to}")
 
 			except KeyError:
 				# dst file not a result of a rename
 				continue
 
-	# Deleting must be done first or backing up a.jpg -> a.JPG (or similar) on Windows will fail
+	# Delete files
 	if trash_root is not None:
 		for dst_relpath in dst_only_relpaths:
 			dst_relpath_real = dst_files.real_names[dst_relpath]
 			src = dst_files.root / dst_relpath_real
 			dst = trash_root     / dst_relpath_real
-			byte_diff = -dst_relpath_stats[dst_relpath][0]
+			byte_diff = -dst_relpath_stats[dst_relpath].size
 			yield ("-", src, dst, byte_diff, f"- {dst_relpath_real}")
 
+	# Create files
 	for src_relpath in src_only_relpaths:
 		src_relpath_real = src_files.real_names[src_relpath]
 		src = src_files.root / src_relpath_real
@@ -638,6 +654,7 @@ def _operations(
 		byte_diff = src_relpath_stats[src_relpath].size
 		yield ("+", src, dst, byte_diff, f"+ {src_relpath_real}")
 
+	# Update files that have newer modification times
 	for relpath in both_relpaths:
 		src_relpath_real = src_files.real_names[relpath]
 		dst_relpath_real = dst_files.real_names[relpath]
@@ -651,6 +668,7 @@ def _operations(
 		elif src_time < dst_time:
 			logger.warning(f"Working copy is older than backed-up copy, skipping update: {relpath}")
 
+	# Create empty directories
 	src_only_empty_dirs = src_files.empty_dirs.difference(dst_files.empty_dirs)#.difference(dst_files.nonempty_dirs)
 	for relpath in src_only_empty_dirs:
 		src_relpath_real = src_files.real_names[relpath]
@@ -659,7 +677,7 @@ def _operations(
 
 def _reverse_dict(old_dict:dict[Any, Any]) -> dict[Any, Any]:
 	'''
-	Reverses a `dict` by swapping keys and values. If a value in `old_dict` appears more than once, then the corresponding key in the reversed `dict` will point to a value of `None`.
+	Reverses a `dict` by swapping keys and values. If a value in `old_dict` appears more than once, then the corresponding key in the reversed `dict` will point to a `None`.
 
 	>>> _reverse_dict({"a":1, "b":2, "c":2})[1]
 	'a'
