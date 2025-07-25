@@ -27,7 +27,7 @@ from typing import NamedTuple, Any
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-class DebugInfoFilter(logging.Filter):
+class _DebugInfoFilter(logging.Filter):
 	'''Logging filter that only allows DEBUG and INFO records to pass.'''
 
 	def filter(self, record):
@@ -228,7 +228,7 @@ def backup(
 	if not quiet:
 		handler_stdout = logging.StreamHandler(sys.stdout)
 		handler_stdout.setFormatter(logging.Formatter("%(message)s"))
-		handler_stdout.addFilter(DebugInfoFilter())
+		handler_stdout.addFilter(_DebugInfoFilter())
 		if debug:
 			handler_stdout.setLevel(logging.DEBUG)
 		else:
@@ -363,7 +363,7 @@ def backup(
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.delete_error += 1
-						msg = error_summary(e)
+						msg = _error_summary(e)
 						logger.error(msg)
 						results.errors.append(msg)
 				elif op == "+":
@@ -373,7 +373,7 @@ def backup(
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.create_error += 1
-						msg = error_summary(e)
+						msg = _error_summary(e)
 						logger.error(msg)
 						results.errors.append(msg)
 				elif op == "U":
@@ -383,7 +383,7 @@ def backup(
 						results.byte_diff += byte_diff
 					except OSError as e:
 						results.update_error += 1
-						msg = error_summary(e)
+						msg = _error_summary(e)
 						logger.error(msg)
 						results.errors.append(msg)
 				elif op == "R":
@@ -392,7 +392,7 @@ def backup(
 						results.rename_success += 1
 					except OSError as e:
 						results.rename_error += 1
-						msg = error_summary(e)
+						msg = _error_summary(e)
 						logger.error(msg)
 						results.errors.append(msg)
 				elif op == "D+":
@@ -401,7 +401,7 @@ def backup(
 						results.dir_create_success += 1
 					except OSError as e:
 						results.dir_create_error += 1
-						msg = error_summary(e)
+						msg = _error_summary(e)
 						logger.error(msg)
 						results.errors.append(msg)
 				elif op == "D-":
@@ -410,7 +410,7 @@ def backup(
 						results.dir_delete_success += 1
 					except OSError as e:
 						results.dir_delete_error += 1
-						msg = error_summary(e)
+						msg = _error_summary(e)
 						logger.error(msg)
 						results.errors.append(msg)
 				else:
@@ -423,7 +423,7 @@ def backup(
 		logger.critical(f"Input Error: {e}")
 		critical_err = True
 	except Exception as e:
-		logger.critical(error_summary(e))
+		logger.critical(_error_summary(e))
 		logger.error(traceback.format_exc())
 		critical_err = True
 
@@ -764,9 +764,9 @@ def _last_bytes(file_path:Path, n:int = 1024) -> bytes:
 		f.seek(-bytes_to_read, os.SEEK_END)
 		return f.read()
 
-def _human_readable_size(num_bytes:int) -> str:
+def _human_readable_size(n:int) -> str:
 	'''
-	Translates `num_bytes` into a human-readable size.
+	Translates `n` bytes into a human-readable size.
 
 	>>> _human_readable_size(1023)
 	'1023 bytes'
@@ -776,21 +776,27 @@ def _human_readable_size(num_bytes:int) -> str:
 	'2 MB'
 	'''
 
-	sign = "-" if num_bytes < 0 else ""
-	num_bytes = abs(num_bytes)
+	sign = "-" if n < 0 else ""
+	n = abs(n)
 	units = ["bytes", "KB", "MB", "GB", "TB", "PB"]
 	i = 0
-	while num_bytes >= 1024 and i < len(units) - 1:
-		num_bytes //= 1024
+	while n >= 1024 and i < len(units) - 1:
+		n //= 1024
 		i += 1
-	return f"{sign}{round(num_bytes)} {units[i]}"
+	return f"{sign}{round(n)} {units[i]}"
 
-def error_summary(err):
-	error_type = type(e).__name__
-	#error_code = getattr(e, "errno", "N/A")
-	error_message = getattr(e, "strerror", "Unknown error")
-	#affected_file = getattr(e, "filename", "N/A")
-	return f"{error_type}: {error_message}"
+def _error_summary(e):
+	'''Get a one-line summary of an Error.'''
+
+	if isinstance(e, OSError):
+		error_type = type(e).__name__
+		affected_file = getattr(e, "filename", "N/A")
+		msg = f"{error_type}: {affected_file}"
+	else:
+		error_type = type(e).__name__
+		error_message = getattr(e, "strerror", "Unknown error")
+		msg = f"{error_type}: {error_message}"
+	return msg
 
 def main() -> None:
 	try:
