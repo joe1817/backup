@@ -158,7 +158,7 @@ class TestBackup(unittest.TestCase):
 
 	#~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-	def test_listdir(self):
+	def test_scandir(self):
 		with tempfile.TemporaryDirectory(suffix=None, prefix=None, dir=None) as temp_root:
 			test_root = Path(temp_root)
 			file_structure = {
@@ -224,8 +224,6 @@ class TestBackup(unittest.TestCase):
 			}
 			create_file_structure(test_root, file_structure)
 
-			################################################################################
-
 			files = backup._scandir(
 				root = test_root,
 				filter = "- b/ c/ + **/*/ **/1.???"
@@ -253,6 +251,58 @@ class TestBackup(unittest.TestCase):
 				"a/aa/aab/12.txt",
 				"a/ab/abb/12.jpg",
 				"a/ac/acb/12.html",
+			]
+			self.assertEqual(
+				sorted(files.relpath_to_stats.keys()),
+				sorted(f.replace("/", os.sep) for f in files_expected)
+			)
+
+			################################################################################
+
+			file_structure = {
+				"f": {
+					"1.txt": None,
+					"2.txt": None,
+				},
+				"e": {
+					"1.txt": None,
+					"2.txt": None,
+				},
+			}
+			create_file_structure(test_root, file_structure)
+			file_structure = {
+				"e": {
+					"ea": test_root / "f",
+				},
+				"d": test_root / "e",
+			}
+			create_file_structure(test_root, file_structure)
+
+			files = backup._scandir(
+				root = test_root / "d",
+				filter = "+ **/*/ **/*",
+			)
+			files_expected = [
+				"1.txt",
+				"2.txt",
+			]
+			self.assertEqual(
+				sorted(files.relpath_to_stats.keys()),
+				sorted(f.replace("/", os.sep) for f in files_expected)
+			)
+
+			################################################################################
+
+			files = backup._scandir(
+				root = test_root / "d",
+				filter = "+ **/*/ **/*",
+				follow_symlinks = True,
+			)
+			files_expected = [
+				"1.txt",
+				"2.txt",
+				"ea/1.txt",
+				"ea/2.txt",
 			]
 			self.assertEqual(
 				sorted(files.relpath_to_stats.keys()),
@@ -399,6 +449,8 @@ class TestBackup(unittest.TestCase):
 			hash_src_old = hash_directory(src)
 			hash_dst_old = hash_directory(dst)
 
+			################################################################################
+
 			# test dry_run
 			self.assertFalse(hash_src_old == hash_dst_old)
 			results = backup.backup(
@@ -409,6 +461,8 @@ class TestBackup(unittest.TestCase):
 				dry_run = True,
 			)
 			self.assertEqual(hash_directory(dst), hash_dst_old)
+
+			################################################################################
 
 			# test basic backup
 			results = backup.backup(
@@ -425,6 +479,8 @@ class TestBackup(unittest.TestCase):
 			else:
 				self.assertEqual(hash_directory(results.trash_root), hash_directory(test_root / "linux_expected_trash"))
 
+			################################################################################
+
 			# test backup with symlink src
 			file_structure = {
 				"src2" : test_root / "src",
@@ -433,16 +489,20 @@ class TestBackup(unittest.TestCase):
 			create_file_structure(test_root, file_structure)
 			src2 = test_root / "src2"
 			dst2 = test_root / "dst2"
+			hash_dst2_old = hash_directory(dst2)
 			results = backup.backup(
 				src2,
 				dst2,
 				quiet = True,
 			)
+			self.assertFalse(hash_directory(dst2) == hash_dst2_old)
 			self.assertEqual(hash_directory(src2), hash_directory(dst2))
+			self.assertEqual(results.create_success, 4)
 		assert not test_root.exists()
 
 		################################################################################
 
+		# test backup involving many overlapping file names
 		with tempfile.TemporaryDirectory(suffix=None, prefix=None, dir=None) as temp_root:
 			test_root = Path(temp_root)
 			file_structure = {
@@ -488,7 +548,6 @@ class TestBackup(unittest.TestCase):
 			create_file_structure(test_root, file_structure)
 			src = test_root / "src"
 			dst = test_root / "dst"
-
 			results = backup.backup(
 				src,
 				dst,
