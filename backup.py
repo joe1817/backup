@@ -302,6 +302,9 @@ def backup(
 		if dst_root.exists() and not dst_root.is_dir():
 			msg = f"Chosen dst_root is not a directory: {dst_root}"
 			raise ValueError(msg)
+		if src_root.resolve() == dst_root.resolve():
+			msg = f"Chosen src_root and dst_root point to the same directory"
+			raise ValueError(msg)
 		if trash_root is not None and trash_root.exists() and not trash_root.is_dir():
 			msg = f"Chosen trash_root is not a directory: {trash_root}"
 			raise ValueError(msg)
