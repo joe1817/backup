@@ -540,7 +540,7 @@ def _scandir(root:Path, *, filter:str = "+ **/*/ **/*", ignore_hidden:bool = Fal
 		normed_dir_relpath = os.path.normcase(dir_relpath)
 
 		# catalog empty directory
-		if dir_relpath != "." and not file_entries and not subdirnames:
+		if dir_relpath != "." and not file_entries and not subdirnames and f.filter(dir_relpath + os.sep):
 			file_list.empty_dirs.add(dir_relpath)
 			file_list.real_names[normed_dir_relpath] = dir_relpath
 			continue
