@@ -13,11 +13,11 @@
 
 `python backup.py src dst`
 
-&emsp; ↳ Recursively copies files inside `src/` to `dst/`, replacing files whose modtimes are newer in `src`.
+&emsp; ↳ Recursively copies files inside `src/` to `dst/`, replacing files whose modtimes are newer in `src/`.
 
 `python backup.py src dst -t trash`
 
-&emsp; ↳ Same as above but will also "recycle" extra files (i.e., those that exist in `dst/` but not `src`) into `trash`.
+&emsp; ↳ Same as above but will also "recycle" extra files (i.e., those that exist in `dst/` but not `src/`) into `trash/`.
 
 ### Include/ Exclude
 
