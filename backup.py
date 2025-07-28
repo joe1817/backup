@@ -246,6 +246,7 @@ def backup(
 		for handler in list(logger.handlers):
 			logger.removeHandler(handler)
 
+	log_file       = None
 	handler_stdout = None
 	handler_stderr = None
 	handler_file   = None
